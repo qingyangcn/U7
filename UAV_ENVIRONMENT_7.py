@@ -1795,14 +1795,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
         
-        # Check if delivery was on-time (same logic as _complete_order_delivery)
-        ready_step = order.get('ready_step')
-        if ready_step is None:
-            ready_step = order['creation_time']
-        
-        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
-        
-        if delivery_lateness <= 0:
+        # Check if delivery was on-time using helper method
+        if self._is_order_on_time(order):
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
 
@@ -3033,6 +3027,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             drone.pop(key, None)
 
     # ------------------ 订单完成/取消（统一走 StateManager）------------------
+    
+    def _is_order_on_time(self, order: dict) -> bool:
+        """
+        Check if an order was delivered on-time.
+        Returns True if delivery_lateness <= 0, False otherwise.
+        """
+        # Use READY-based SLA for on-time calculation
+        # Lateness = delivery_time - (ready_step + sla_steps)
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+        
+        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+        return delivery_lateness <= 0
 
     def _complete_order_delivery(self, order_id, drone_id):
         if order_id not in self.orders:
@@ -3058,22 +3066,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        # Use READY-based SLA for on-time calculation and lateness tracking
-        # Note: Lateness uses pure SLA (not timeout_factor), as timeout is for cancellation only
-        # Lateness = delivery_time - (ready_step + sla_steps)
-        # Use ready_step with creation_time as fallback if ready_step wasn't set
+        # Calculate delivery lateness for diagnostics
         ready_step = order.get('ready_step')
         if ready_step is None:
             ready_step = order['creation_time']
-
+        
         delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
-
+        
         # Record lateness for diagnostics
         if 'ready_based_lateness_samples' not in self.metrics:
             self.metrics['ready_based_lateness_samples'] = []
         self.metrics['ready_based_lateness_samples'].append(delivery_lateness)
 
-        if delivery_lateness <= 0:
+        # Check if delivery was on-time using helper method
+        if self._is_order_on_time(order):
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
 
