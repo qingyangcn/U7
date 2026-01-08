@@ -1794,6 +1794,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
+        
+        # Check if delivery was on-time (same logic as _complete_order_delivery)
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+        
+        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+        
+        if delivery_lateness <= 0:
+            self.metrics['on_time_deliveries'] += 1
+            self.daily_stats['on_time_deliveries'] += 1
 
         self.active_orders.discard(order_id)
         self.completed_orders.add(order_id)
