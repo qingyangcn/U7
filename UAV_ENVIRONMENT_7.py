@@ -1128,6 +1128,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'total_flight_distance': 0.0,
             'optimal_flight_distance': 0.0,
         }
+        
+        # Debug tracking for on_time_deliveries (to detect decreases)
+        self._prev_on_time_deliveries = 0
+        self._on_time_decrease_warned = False
 
         # 性能指标
         self.metrics = {
@@ -1498,6 +1502,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         self._reset_drones_and_bases()
         self._reset_daily_stats()
+        
+        # Reset debug tracking for on_time_deliveries
+        self._prev_on_time_deliveries = 0
+        self._on_time_decrease_warned = False
 
         self.last_stats = {
             'completed': 0,
@@ -1580,6 +1588,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # 更新系统状态（扩展点）
         self._update_system_state()
+        
+        # Debug guard: Check if on_time_deliveries ever decreases
+        if self.debug_state_warnings:
+            current_on_time = self.daily_stats.get('on_time_deliveries', 0)
+            if current_on_time < self._prev_on_time_deliveries and not self._on_time_decrease_warned:
+                print(f"[WARNING] on_time_deliveries decreased from {self._prev_on_time_deliveries} to {current_on_time} at step {self.time_system.current_step}")
+                self._on_time_decrease_warned = True
+            self._prev_on_time_deliveries = current_on_time
 
         # 生成新订单（高负载）
         self._generate_new_orders()
