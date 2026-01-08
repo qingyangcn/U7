@@ -82,45 +82,49 @@ def greedy_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, max_ready: int =
 
 def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPlanner) -> int:
     """
-    Preferred assignment-only path.
+    Preferred assignment-only path using the new U7MOPSOAssigner.
 
-    If U7_mopso_dispatcher.py defines apply_mopso_assignment(env, planner), use it.
-    Otherwise:
-      - Run planner.mopso_dispatch(env) to get plans, but DO NOT apply planned_stops.
-      - Instead, extract commit_orders and call env._process_single_assignment for each.
-    Finally fallback to greedy_assignment_only if neither works.
+    Task 3: Uses prioritize_idle=True and allow_busy_fallback=False by default
+    to avoid assigning new READY orders to busy drones, improving on-time rate.
+
+    Args:
+        env: Environment instance
+        planner: MOPSOPlanner instance (used to create U7MOPSOAssigner)
+
+    Returns:
+        Number of orders assigned
     """
-    # 1) If dispatcher provides an explicit assignment-only helper, use it.
+    # 1) Use the new U7MOPSOAssigner with proper configuration
     try:
-        from U7_mopso_dispatcher import apply_mopso_assignment  # type: ignore
-        # If import succeeds and callable exists, use it.
-        if callable(apply_mopso_assignment):
-            # expected to do READY->ASSIGNED without installing planned_stops
-            res = apply_mopso_assignment(env, planner)
-            # allow either int or dict return
-            if isinstance(res, int):
-                return res
-            return 0
-    except Exception:
-        pass
-
-    # 2) Soft fallback: use current planner output but ignore route stops.
-    try:
-        plans = planner.mopso_dispatch(env)
-        if not plans:
-            return 0
-
+        from U7_mopso_dispatcher import U7MOPSOAssigner
+        
+        # Create assigner with safe defaults: IDLE drones only, no busy fallback
+        assigner = U7MOPSOAssigner(
+            n_particles=planner.n_particles,
+            n_iterations=planner.n_iterations,
+            max_orders=planner.max_orders,
+            max_orders_per_drone=planner.max_orders_per_drone,
+            prioritize_idle=True,  # Task 3: Prioritize IDLE drones
+            allow_busy_fallback=False,  # Task 3: Do not assign to busy drones
+        )
+        
+        # Get assignment from MOPSO
+        assignment = assigner.assign_orders(env)
+        
+        # Apply assignments to environment using _process_single_assignment
         assigned = 0
-        for drone_id, (_planned_stops, commit_orders) in plans.items():
-            for oid in commit_orders:
+        for drone_id, order_ids in assignment.items():
+            for oid in order_ids:
                 before = env.drones[int(drone_id)]["current_load"]
                 env._process_single_assignment(int(drone_id), int(oid), allow_busy=True)
                 after = env.drones[int(drone_id)]["current_load"]
                 if after > before:
                     assigned += 1
         return assigned
-    except Exception:
-        # 3) Hard fallback
+    except Exception as e:
+        # Fallback to greedy assignment if something goes wrong
+        import warnings
+        warnings.warn(f"Failed to use U7MOPSOAssigner: {e}. Falling back to greedy assignment.")
         return greedy_assignment_only(env)
 
 
