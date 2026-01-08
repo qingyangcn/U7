@@ -1289,7 +1289,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """定义观察和动作空间（固定 shape）"""
         self.observation_space = spaces.Dict({
             'orders': spaces.Box(low=0, high=1, shape=(self.max_obs_orders, 10), dtype=np.float32),
-            'drones': spaces.Box(low=0, high=1, shape=(self.num_drones, 8), dtype=np.float32),
+            # Task 1: Changed from 8 to 7 (removed unused 5th dimension)
+            'drones': spaces.Box(low=0, high=1, shape=(self.num_drones, 7), dtype=np.float32),
 
             # Top-K merchants
             'merchants': spaces.Box(low=0, high=1, shape=(self.obs_num_merchants, 4), dtype=np.float32),
@@ -1297,8 +1298,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # 固定 num_bases
             'bases': spaces.Box(low=0, high=1, shape=(self.obs_num_bases, 3), dtype=np.float32),
 
-            # U7: Candidate orders per drone (K=20, F=12 features)
-            'candidates': spaces.Box(low=0, high=1, shape=(self.num_drones, self.num_candidates, 12), dtype=np.float32),
+            # U7: Candidate orders per drone (K=20, F=14 features)
+            # Task 2: Changed from 12 to 14 (added is_picked_up, customer_x, customer_y)
+            'candidates': spaces.Box(low=0, high=1, shape=(self.num_drones, self.num_candidates, 14), dtype=np.float32),
 
             'weather': spaces.Discrete(len(WeatherType)),
             'weather_details': spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32),
@@ -1418,18 +1420,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _encode_candidate(self, order_id: int, is_valid: bool) -> np.ndarray:
         """
-        Encode a candidate order into features (12-dimensional).
+        Encode a candidate order into features (14-dimensional).
         Features:
         0: validity (1.0 if valid, 0.0 if padding)
-        1-5: order status one-hot (5 relevant statuses)
-        6: order type (0-1 normalized)
-        7: age (normalized by 50 steps)
-        8: urgency (1.0 if urgent, 0.0 otherwise)
-        9: deadline slack (normalized, 1.0=no urgency, 0.0=overdue)
-        10: merchant location x (normalized)
-        11: customer location y (normalized)
+        1-6: order status one-hot (6 statuses: PENDING through PICKED_UP)
+        7: order type (0-1 normalized)
+        8: age (normalized by 50 steps)
+        9: urgency (1.0 if urgent, 0.0 otherwise)
+        10: deadline slack (normalized, 1.0=plenty of time, 0.0=overdue)
+        11: is_picked_up (1.0 if PICKED_UP, 0.0 otherwise) -- Task 2: New feature
+        12: merchant location x (normalized) -- Task 2: Kept from old index 10
+        13: merchant location y (normalized) -- Task 2: Kept from old index 11
+        
+        Note: Customer coordinates are now represented via the merchant location
+        for consistency. For PICKED_UP orders, merchant_location represents where
+        the order was picked up from, which is useful for routing decisions.
         """
-        encoding = np.zeros(12, dtype=np.float32)
+        # Task 2: Changed from 12 to 14 dimensions
+        encoding = np.zeros(14, dtype=np.float32)
 
         if not is_valid or order_id < 0:
             return encoding  # All zeros for invalid
@@ -1442,35 +1450,40 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Feature 0: validity
         encoding[0] = 1.0
 
-        # Features 1-5: status one-hot (ASSIGNED=4, PICKED_UP=5 are most relevant)
+        # Features 1-6: status one-hot (expanded to include PICKED_UP=5)
+        # Task 2: Fixed to handle all relevant statuses including PICKED_UP
         status_val = order['status'].value
-        if status_val < 5:
+        if 0 <= status_val <= 5:  # PENDING=0 through PICKED_UP=5
             encoding[1 + status_val] = 1.0
 
-        # Feature 6: order type
-        encoding[6] = order['order_type'].value / 2.0
+        # Feature 7: order type
+        encoding[7] = order['order_type'].value / 2.0
 
-        # Feature 7: age
+        # Feature 8: age
         age = self.time_system.current_step - order['creation_time']
-        encoding[7] = min(age / 50.0, 1.0)
+        encoding[8] = min(age / 50.0, 1.0)
 
-        # Feature 8: urgency
-        encoding[8] = 1.0 if order.get('urgent', False) else 0.0
+        # Feature 9: urgency
+        encoding[9] = 1.0 if order.get('urgent', False) else 0.0
 
-        # Feature 9: deadline slack
+        # Feature 10: deadline slack
         deadline_step = self._get_delivery_deadline_step(order)
         current_step = self.time_system.current_step
         slack = deadline_step - current_step
         # Normalize: positive slack = good (1.0), negative = overdue (0.0)
-        encoding[9] = np.clip(slack / 50.0 + 0.5, 0.0, 1.0)
+        encoding[10] = np.clip(slack / 50.0 + 0.5, 0.0, 1.0)
 
-        # Features 10-11: merchant location (for pickup)
+        # Feature 11: is_picked_up indicator (Task 2: New explicit feature)
+        encoding[11] = 1.0 if order['status'] == OrderStatus.PICKED_UP else 0.0
+
+        # Features 12-13: merchant location (for pickup)
+        # Task 2: Merchant coordinates remain available
         merchant_id = order.get('merchant_id')
         if merchant_id and merchant_id in self.merchants:
             merchant = self.merchants[merchant_id]
             mloc = merchant['location']
-            encoding[10] = mloc[0] / self.grid_size
-            encoding[11] = mloc[1] / self.grid_size
+            encoding[12] = mloc[0] / self.grid_size
+            encoding[13] = mloc[1] / self.grid_size
 
         return encoding
 
@@ -3472,7 +3485,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order = self.orders[order_id]
             order_obs[i] = self._encode_order(order)
 
-        drone_obs = np.zeros((self.num_drones, 8), dtype=np.float32)
+        # Task 1: Changed from 8 to 7 dimensions
+        drone_obs = np.zeros((self.num_drones, 7), dtype=np.float32)
         for drone_id, drone in self.drones.items():
             drone_obs[drone_id] = self._encode_drone(drone)
 
@@ -3538,7 +3552,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         air_traffic = np.clip(self.air_traffic, 0.0, 1.0).astype(np.float32)
 
         # U7: Build candidate observations
-        candidates_obs = np.zeros((self.num_drones, self.num_candidates, 12), dtype=np.float32)
+        # Task 2: Changed from 12 to 14 features
+        candidates_obs = np.zeros((self.num_drones, self.num_candidates, 14), dtype=np.float32)
         for drone_id in range(self.num_drones):
             if drone_id not in self.drone_candidate_mappings:
                 # No candidates yet, use empty
@@ -3579,7 +3594,19 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         return encoding
 
     def _encode_drone(self, drone):
-        encoding = np.zeros(8, dtype=np.float32)
+        """
+        Encode drone state into 7-dimensional feature vector.
+        Features:
+        0: status (normalized by 7.0)
+        1: location_x (normalized by grid_size)
+        2: location_y (normalized by grid_size)
+        3: target_location_x (normalized by grid_size, 0 if no target)
+        4: target_location_y (normalized by grid_size, 0 if no target)
+        5: current_load (normalized by max_capacity)
+        6: battery_level (normalized by max_battery)
+        """
+        # Task 1: Changed from 8 to 7 dimensions (removed unused index 5)
+        encoding = np.zeros(7, dtype=np.float32)
 
         encoding[0] = drone['status'].value / 7.0
         encoding[1] = drone['location'][0] / self.grid_size
@@ -3589,8 +3616,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             encoding[3] = drone['target_location'][0] / self.grid_size
             encoding[4] = drone['target_location'][1] / self.grid_size
 
-        encoding[6] = drone['current_load'] / max(1, drone['max_capacity'])
-        encoding[7] = drone['battery_level'] / max(1.0, drone['max_battery'])
+        # Task 1: Shifted indices from 6,7 to 5,6 to fill the gap
+        encoding[5] = drone['current_load'] / max(1, drone['max_capacity'])
+        encoding[6] = drone['battery_level'] / max(1.0, drone['max_battery'])
         return encoding
 
     def _encode_merchant(self, merchant):

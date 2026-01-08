@@ -41,6 +41,9 @@ class U7MOPSOAssigner:
                  max_orders: int = 200,
                  max_orders_per_drone: int = 10,
                  seed: Optional[int] = None,
+                 # Task 3: New parameters for assignment policy
+                 prioritize_idle: bool = True,
+                 allow_busy_fallback: bool = False,
                  **mopso_kwargs):
         """
         Initialize U7 MOPSO assigner.
@@ -51,6 +54,8 @@ class U7MOPSOAssigner:
             max_orders: Maximum orders to consider
             max_orders_per_drone: Maximum orders per drone (capacity constraint)
             seed: Random seed
+            prioritize_idle: If True, use two-pass assignment (IDLE first, then busy)
+            allow_busy_fallback: If True, allow assignment to busy drones in second pass
             **mopso_kwargs: Additional arguments for MOPSOPlanner
         """
         # Reuse the existing MOPSO planner but only use assignment logic
@@ -62,6 +67,9 @@ class U7MOPSOAssigner:
             seed=seed,
             **mopso_kwargs
         )
+        # Task 3: Assignment policy parameters
+        self.prioritize_idle = prioritize_idle
+        self.allow_busy_fallback = allow_busy_fallback
 
     def assign_orders(self, env,
                      ready_orders: Optional[List[dict]] = None,
@@ -71,6 +79,10 @@ class U7MOPSOAssigner:
                      objective_weights: Optional[np.ndarray] = None) -> Dict[int, List[int]]:
         """
         Assign READY orders to drones using MOPSO.
+
+        Task 3: Implements two-pass assignment policy:
+        - First pass: Assign only to IDLE drones with capacity
+        - Second pass (optional): If enabled and many READY remain, allow busy drones
 
         Args:
             env: Environment instance
@@ -95,11 +107,103 @@ class U7MOPSOAssigner:
         if objective_weights is None:
             objective_weights = getattr(env, 'objective_weights', np.array([0.33, 0.33, 0.34]))
 
-        # Filter available drones (not just IDLE, but also those with capacity)
+        # Task 3: First pass - prioritize IDLE drones
+        if self.prioritize_idle:
+            # Import DroneStatus to check status
+            try:
+                from UAV_ENVIRONMENT_7 import DroneStatus
+            except ImportError:
+                DroneStatus = None
+
+            # First pass: IDLE drones only
+            idle_drones = []
+            for d in drones:
+                current_load = d.get('current_load', 0)
+                max_capacity = d.get('max_capacity', 10)
+                if current_load >= max_capacity:
+                    continue
+                
+                # Check if drone is IDLE
+                status = d.get('status')
+                if DroneStatus is not None:
+                    is_idle = (status == DroneStatus.IDLE)
+                else:
+                    # Fallback: assume status 0 is IDLE
+                    is_idle = (status.value == 0 if hasattr(status, 'value') else status == 0)
+                
+                if is_idle:
+                    idle_drones.append(d)
+
+            if idle_drones and ready_orders:
+                # Limit orders to max_orders
+                ready_orders_limited = ready_orders[:self.planner.max_orders]
+                
+                # Run MOPSO with IDLE drones only
+                assignment = self.planner._run_mopso(
+                    ready_orders_limited, idle_drones, merchants, constraints, objective_weights
+                )
+                
+                # If we got good coverage or fallback is disabled, return
+                if not self.allow_busy_fallback or not assignment:
+                    return assignment
+                
+                # Count how many orders were assigned
+                assigned_count = sum(len(orders) for orders in assignment.values())
+                remaining_count = len(ready_orders_limited) - assigned_count
+                
+                # If less than 30% remain unassigned, skip busy fallback
+                if remaining_count < len(ready_orders_limited) * 0.3:
+                    return assignment
+                
+                # Otherwise, proceed to second pass with remaining orders
+                assigned_order_ids = set()
+                for order_list in assignment.values():
+                    assigned_order_ids.update(order_list)
+                
+                remaining_orders = [o for o in ready_orders_limited 
+                                  if o['order_id'] not in assigned_order_ids]
+                
+                # Second pass: allow busy drones
+                busy_drones = []
+                for d in drones:
+                    current_load = d.get('current_load', 0)
+                    max_capacity = d.get('max_capacity', 10)
+                    if current_load >= max_capacity:
+                        continue
+                    
+                    # Include non-IDLE drones with capacity
+                    status = d.get('status')
+                    if DroneStatus is not None:
+                        is_idle = (status == DroneStatus.IDLE)
+                    else:
+                        is_idle = (status.value == 0 if hasattr(status, 'value') else status == 0)
+                    
+                    if not is_idle:
+                        busy_drones.append(d)
+                
+                if busy_drones and remaining_orders:
+                    # Run MOPSO for remaining orders with busy drones
+                    busy_assignment = self.planner._run_mopso(
+                        remaining_orders, busy_drones, merchants, constraints, objective_weights
+                    )
+                    
+                    # Merge assignments
+                    for drone_id, order_ids in busy_assignment.items():
+                        if drone_id in assignment:
+                            assignment[drone_id].extend(order_ids)
+                        else:
+                            assignment[drone_id] = order_ids
+                
+                return assignment
+            
+            # If no IDLE drones but fallback enabled, fall through to old logic
+            if not self.allow_busy_fallback:
+                return {}
+
+        # Old logic: Include drones that have capacity, regardless of status
+        # Used when prioritize_idle=False or as fallback
         available_drones = []
         for d in drones:
-            # Include drones that have capacity, regardless of status
-            # MOPSO can assign to busy drones that will serve orders later
             current_load = d.get('current_load', 0)
             max_capacity = d.get('max_capacity', 10)
             if current_load < max_capacity:
@@ -123,16 +227,17 @@ def apply_mopso_assignment(env, assigner: Optional[U7MOPSOAssigner] = None, **kw
     """
     Apply MOPSO assignment to environment (assignment only, no route planning).
 
-    This function:
-    1. Gets READY orders
-    2. Uses MOPSO to assign them to drones
-    3. Updates order status to ASSIGNED
-    4. Does NOT create planned_stops (PPO handles routing)
+    Task 3: This function only assigns READY orders to drones (READY -> ASSIGNED).
+    It does NOT create planned_stops. PPO handles task selection and routing.
+
+    The assignment follows the configured policy (see U7MOPSOAssigner parameters):
+    - prioritize_idle=True (default): First assign to IDLE drones, optionally fallback to busy
+    - allow_busy_fallback=False (default): Do not assign to busy drones at all
 
     Args:
         env: Environment instance
         assigner: U7MOPSOAssigner instance (created if None)
-        **kwargs: Additional arguments for assigner
+        **kwargs: Additional arguments for assigner (e.g., prioritize_idle, allow_busy_fallback)
 
     Returns:
         Dict mapping drone_id to count of newly assigned orders

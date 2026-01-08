@@ -1,10 +1,10 @@
 """
-PPO Evaluation/Inference Script.
+PPO Evaluation/Inference Script for U7.
 
-Evaluates a trained PPO model with MOPSO dispatcher and reports daily statistics.
+Evaluates a trained PPO model with MOPSO assignment-only dispatcher and reports daily statistics.
 
 Usage:
-    python ppo/U6_eval_ppo.py --model models/ppo_uav_final.zip --episodes 10
+    python U7_eval_ppo.py --model models/ppo_u7_task_final.zip --episodes 10
 """
 import argparse
 import os
@@ -16,15 +16,18 @@ import numpy as np
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from UAV_ENVIRONMENT_6 import ThreeObjectiveDroneDeliveryEnv
-from U6_mopso_dispatcher import MOPSOPlanner, apply_mopso_dispatch
-from U6_flatten_action import FlattenActionWrapper
-from U6_train_ppo import MOPSOWrapper
+# Task 4: Use UAV_ENVIRONMENT_7 instead of UAV_ENVIRONMENT_6
+from UAV_ENVIRONMENT_7 import ThreeObjectiveDroneDeliveryEnv
+from U7_mopso_dispatcher import U7MOPSOAssigner
+# Import the wrapper from U7_train instead of U6_train
+from U7_train import MOPSOAssignWrapper, make_env
 
 
 def make_eval_env(seed: int = 0, enable_random_events: bool = False):
     """
     Create environment for evaluation.
+
+    Task 4: Uses UAV_ENVIRONMENT_7 with proper configuration.
 
     Args:
         seed: Random seed
@@ -33,23 +36,19 @@ def make_eval_env(seed: int = 0, enable_random_events: bool = False):
     Returns:
         Wrapped environment
     """
-    env = ThreeObjectiveDroneDeliveryEnv(
-        grid_size=16,
-        num_drones=6,
-        max_orders=100,
-        steps_per_hour=4,
-        drone_max_capacity=10,
-        reward_output_mode="zero",
+    # Use the same make_env function from U7_train to ensure consistency
+    env = make_env(
+        seed=seed,
+        num_drones=10,  # Match training defaults
+        obs_max_orders=400,
+        top_k_merchants=100,
+        candidate_k=20,
         enable_random_events=enable_random_events,
-        fixed_objective_weights=(0.5, 0.3, 0.2),
+        debug_state_warnings=False,
+        mopso_max_orders=400,
+        mopso_max_orders_per_drone=5,
     )
-
-    # Wrap with MOPSO dispatcher
-    env = MOPSOWrapper(env)
-
-    # Flatten action space
-    env = FlattenActionWrapper(env)
-
+    
     return env
 
 
