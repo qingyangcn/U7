@@ -3028,19 +3028,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     # ------------------ 订单完成/取消（统一走 StateManager）------------------
     
+    def _calculate_delivery_lateness(self, order: dict) -> float:
+        """
+        Calculate delivery lateness for an order.
+        Returns: delivery_lateness = delivery_time - (ready_step + sla_steps)
+        Positive values indicate late delivery, negative/zero indicate on-time.
+        """
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+        
+        return order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+    
     def _is_order_on_time(self, order: dict) -> bool:
         """
         Check if an order was delivered on-time.
         Returns True if delivery_lateness <= 0, False otherwise.
         """
-        # Use READY-based SLA for on-time calculation
-        # Lateness = delivery_time - (ready_step + sla_steps)
-        ready_step = order.get('ready_step')
-        if ready_step is None:
-            ready_step = order['creation_time']
-        
-        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
-        return delivery_lateness <= 0
+        return self._calculate_delivery_lateness(order) <= 0
 
     def _complete_order_delivery(self, order_id, drone_id):
         if order_id not in self.orders:
@@ -3066,12 +3071,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        # Calculate delivery lateness for diagnostics
-        ready_step = order.get('ready_step')
-        if ready_step is None:
-            ready_step = order['creation_time']
-        
-        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+        # Calculate delivery lateness for diagnostics using helper method
+        delivery_lateness = self._calculate_delivery_lateness(order)
         
         # Record lateness for diagnostics
         if 'ready_based_lateness_samples' not in self.metrics:
