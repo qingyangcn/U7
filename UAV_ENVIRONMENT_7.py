@@ -1021,8 +1021,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,  # 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
-                 delivery_sla_steps: int = 60,  # READY-based delivery SLA in steps
-                 timeout_factor: float = 1.0,  # Multiplier for deadline calculation
+                 delivery_sla_steps: int = 3,  # READY-based delivery SLA in steps
+                 timeout_factor: float = 4.0,  # Multiplier for deadline calculation
                  # ===== U7: Task selection parameters =====
                  num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
                  ):
@@ -1129,6 +1129,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'optimal_flight_distance': 0.0,
         }
 
+        # Debug tracking for on_time_deliveries (to detect decreases)
+        self._prev_on_time_deliveries = 0
+        self._on_time_decrease_warned = False
+
         # 性能指标
         self.metrics = {
             'total_orders': 0,
@@ -1160,7 +1164,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.weather_details = {}
 
         # 营业后履约
-        self.allow_overtime_fulfillment = True
+        self.allow_overtime_fulfillment = False
         self.overtime_max_steps = self.time_system.steps_per_hour * 4
         self.in_overtime = False
         self.overtime_steps = 0
@@ -1499,6 +1503,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._reset_drones_and_bases()
         self._reset_daily_stats()
 
+        # Reset debug tracking for on_time_deliveries
+        self._prev_on_time_deliveries = 0
+        self._on_time_decrease_warned = False
+
         self.last_stats = {
             'completed': 0,
             'energy': 0,
@@ -1542,6 +1550,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"营业时间: {self.time_system.start_hour}:00 - {self.time_system.end_hour}:00")
         print(f"今日天气: {self.weather_details.get('summary', 'Unknown')}")
         print(f"无人机数量: {self.num_drones}, 订单观测窗口: {self.max_obs_orders}, 商家TopK: {self.obs_num_merchants}")
+
         return obs, info
 
     def step(self, action):
@@ -1580,6 +1589,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # 更新系统状态（扩展点）
         self._update_system_state()
+
+        # Debug guard: Check if on_time_deliveries ever decreases
+        if self.debug_state_warnings:
+            current_on_time = self.daily_stats.get('on_time_deliveries', 0)
+            if current_on_time < self._prev_on_time_deliveries and not self._on_time_decrease_warned:
+                print(
+                    f"[WARNING] on_time_deliveries decreased from {self._prev_on_time_deliveries} to {current_on_time} at step {self.time_system.current_step}")
+                self._on_time_decrease_warned = True
+            self._prev_on_time_deliveries = current_on_time
 
         # 生成新订单（高负载）
         self._generate_new_orders()
@@ -1779,6 +1797,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
+        # Check if delivery was on-time using helper method
+        if self._is_order_on_time(order):
+            self.metrics['on_time_deliveries'] += 1
+            self.daily_stats['on_time_deliveries'] += 1
         self.active_orders.discard(order_id)
         self.completed_orders.add(order_id)
 
@@ -1960,7 +1982,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             # Map speed: [-1, 1] -> [0.5, 1.5]
             speed_multiplier = (speed_raw + 1.0) / 2.0 * (
-                        SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
+                    SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
             speed_multiplier = np.clip(speed_multiplier, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
 
             # Store speed multiplier (used in movement)
@@ -3007,6 +3029,25 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     # ------------------ 订单完成/取消（统一走 StateManager）------------------
 
+    def _calculate_delivery_lateness(self, order: dict) -> float:
+        """
+        Calculate delivery lateness for an order.
+        Returns: delivery_lateness = delivery_time - (ready_step + sla_steps)
+        Positive values indicate late delivery, negative/zero indicate on-time.
+        """
+        ready_step = order.get('ready_step')
+        if ready_step is None:
+            ready_step = order['creation_time']
+
+        return order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+
+    def _is_order_on_time(self, order: dict) -> bool:
+        """
+        Check if an order was delivered on-time.
+        Returns True if delivery_lateness <= 0, False otherwise.
+        """
+        return self._calculate_delivery_lateness(order) <= 0
+
     def _complete_order_delivery(self, order_id, drone_id):
         if order_id not in self.orders:
             return
@@ -3031,22 +3072,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
 
-        # Use READY-based SLA for on-time calculation and lateness tracking
-        # Note: Lateness uses pure SLA (not timeout_factor), as timeout is for cancellation only
-        # Lateness = delivery_time - (ready_step + sla_steps)
-        # Use ready_step with creation_time as fallback if ready_step wasn't set
-        ready_step = order.get('ready_step')
-        if ready_step is None:
-            ready_step = order['creation_time']
-
-        delivery_lateness = order['delivery_time'] - ready_step - self._get_delivery_sla_steps(order)
+        # Calculate delivery lateness for diagnostics using helper method
+        delivery_lateness = self._calculate_delivery_lateness(order)
 
         # Record lateness for diagnostics
         if 'ready_based_lateness_samples' not in self.metrics:
             self.metrics['ready_based_lateness_samples'] = []
         self.metrics['ready_based_lateness_samples'].append(delivery_lateness)
 
-        if delivery_lateness <= 0:
+        # Check if delivery was on-time using helper method
+        if self._is_order_on_time(order):
             self.metrics['on_time_deliveries'] += 1
             self.daily_stats['on_time_deliveries'] += 1
 
