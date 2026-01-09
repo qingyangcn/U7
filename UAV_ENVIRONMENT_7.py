@@ -1710,10 +1710,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'cancellation_rate': random.uniform(0.005, 0.015),
                 'total_distance_today': 0.0,
             }
-            self.drones[i]['planned_stops'] = deque()
             self.drones[i]['cargo'] = set()
-            self.drones[i]['current_stop'] = None
-            self.drones[i]['route_committed'] = False
             self.drones[i]['serving_order_id'] = None  # U7 task-selection state
             keys_to_remove = ['task_start_location', 'task_start_step', 'accumulated_distance',
                               'optimal_distance', 'last_location', 'target_location',
