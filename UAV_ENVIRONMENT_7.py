@@ -18,6 +18,10 @@ plt.rcParams['axes.unicode_minus'] = False
 SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
 SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
 
+# ===== Constants for state management =====
+ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
+DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
+
 
 # Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
 
@@ -194,6 +198,31 @@ class StateManager:
         self.state_log.append(state_change)
 
         return True
+
+    @staticmethod
+    def categorize_issues(issues: List[str]) -> Dict[str, int]:
+        """
+        Categorize consistency issues by type.
+        
+        Args:
+            issues: List of issue strings
+            
+        Returns:
+            Dictionary with counts per category: Route, TaskSel, Legacy, Other
+        """
+        categories = {'Route': 0, 'TaskSel': 0, 'Legacy': 0, 'Other': 0}
+        
+        for issue in issues:
+            if '[Route]' in issue:
+                categories['Route'] += 1
+            elif '[TaskSel]' in issue:
+                categories['TaskSel'] += 1
+            elif '[Legacy]' in issue:
+                categories['Legacy'] += 1
+            else:
+                categories['Other'] += 1
+        
+        return categories
 
     def get_state_consistency_check(self):
         """检查状态一致性 (Route-aware for Task B, Task-selection aware for U7)"""
@@ -2042,7 +2071,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         dist_to_target = self._get_dist_to_target(drone_id)
 
         # If very close to target and in appropriate status
-        if dist_to_target < 0.15:
+        if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
             if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
                 # At merchant - decision point after pickup
                 return True
@@ -2622,8 +2651,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if self.debug_state_warnings:
             # Detailed mode: print all issues with categorization
             if consistency_issues:
-                # Categorize issues
-                categories = {
+                # Categorize issues using helper method
+                category_lists = {
                     'Route': [],
                     'TaskSel': [],
                     'Legacy': [],
@@ -2632,16 +2661,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 
                 for issue in consistency_issues:
                     if '[Route]' in issue:
-                        categories['Route'].append(issue)
+                        category_lists['Route'].append(issue)
                     elif '[TaskSel]' in issue:
-                        categories['TaskSel'].append(issue)
+                        category_lists['TaskSel'].append(issue)
                     elif '[Legacy]' in issue:
-                        categories['Legacy'].append(issue)
+                        category_lists['Legacy'].append(issue)
                     else:
-                        categories['Other'].append(issue)
+                        category_lists['Other'].append(issue)
                 
                 print(f"\n=== 状态一致性警告 (Step {self.time_system.current_step}) ===")
-                for category, issues in categories.items():
+                for category, issues in category_lists.items():
                     if issues:
                         print(f"\n{category} 问题 ({len(issues)}):")
                         for issue in issues:
@@ -2651,23 +2680,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Periodic summary mode: print categorized count every 64 steps
             if self.time_system.current_step % 64 == 0:
                 if consistency_issues:
-                    # Categorize and count
-                    counts = {
-                        'Route': 0,
-                        'TaskSel': 0,
-                        'Legacy': 0,
-                        'Other': 0
-                    }
-                    
-                    for issue in consistency_issues:
-                        if '[Route]' in issue:
-                            counts['Route'] += 1
-                        elif '[TaskSel]' in issue:
-                            counts['TaskSel'] += 1
-                        elif '[Legacy]' in issue:
-                            counts['Legacy'] += 1
-                        else:
-                            counts['Other'] += 1
+                    # Categorize and count using helper method
+                    counts = self.state_manager.categorize_issues(consistency_issues)
                     
                     # Print summary
                     category_str = ", ".join([f"{k}={v}" for k, v in counts.items() if v > 0])
@@ -3101,7 +3115,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Verify we're at the right merchant
                     if merchant_id and merchant_id in self.merchants:
                         merchant_loc = self.merchants[merchant_id]['location']
-                        if self._calculate_euclidean_distance(drone['location'], merchant_loc) < 0.5:
+                        if self._calculate_euclidean_distance(drone['location'], merchant_loc) < ARRIVAL_THRESHOLD:
                             # Perform pickup
                             self.state_manager.update_order_status(
                                 serving_order_id, OrderStatus.PICKED_UP, 
@@ -3127,7 +3141,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order['status'] == OrderStatus.PICKED_UP and order.get('assigned_drone') == drone_id:
                     customer_loc = order.get('customer_location')
                     # Verify we're at the right customer location
-                    if customer_loc and self._calculate_euclidean_distance(drone['location'], customer_loc) < 0.5:
+                    if customer_loc and self._calculate_euclidean_distance(drone['location'], customer_loc) < ARRIVAL_THRESHOLD:
                         # Perform delivery
                         self._complete_order_delivery(serving_order_id, drone_id)
                         
