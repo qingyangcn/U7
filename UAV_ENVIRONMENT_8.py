@@ -18,6 +18,9 @@ plt.rcParams['axes.unicode_minus'] = False
 SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
 SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
 
+# ===== Constants for diagnostics =====
+FORCE_COMPLETE_WARNING_THRESHOLD = 10.0  # Warn if force-complete rate exceeds this % of deliveries
+
 # ===== Constants for state management =====
 ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
@@ -158,6 +161,10 @@ class StateManager:
         if new_status == OrderStatus.READY and old_status != OrderStatus.READY:
             if order.get('ready_step') is None:
                 order['ready_step'] = self.env.time_system.current_step
+                if self.env.debug_env_dynamics:
+                    print(f"[READY_STEP] Step {self.env.time_system.current_step}: Order {order_id} ready_step set to {order['ready_step']}")
+            elif self.env.debug_env_dynamics:
+                print(f"[READY_STEP WARNING] Step {self.env.time_system.current_step}: Order {order_id} already has ready_step={order.get('ready_step')}, not overwriting")
 
         # 记录状态变更
         state_change = {
@@ -1089,6 +1096,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,  # 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
+                 debug_env_dynamics: bool = False,  # Debug flag for environment dynamics diagnostics
                  delivery_sla_steps: int = 3,  # READY-based delivery SLA in steps
                  timeout_factor: float = 4.0,  # Multiplier for deadline calculation
                  # ===== U7: Task selection parameters =====
@@ -1123,9 +1131,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.reward_output_mode = str(reward_output_mode)
         self.enable_random_events = bool(enable_random_events)
         self.debug_state_warnings = bool(debug_state_warnings)  # Task B: debug flag
+        self.debug_env_dynamics = bool(debug_env_dynamics)  # Debug flag for dynamics diagnostics
         self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
         self.timeout_factor = float(timeout_factor)  # Deadline multiplier
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
+        
+        # Diagnostics tracking for environment dynamics
+        self.dynamics_diagnostics = {
+            'cleanup_calls': 0,
+            'cleanup_cancellations': 0,
+            'force_sync_calls': 0,
+            'force_sync_status_changes': 0,
+            'force_sync_cargo_changes': 0,
+            'force_complete_calls': 0,  # Track force_complete_order calls
+            'delivery_attempts': 0,
+            'delivery_success': 0,
+            'delivery_failures': [],  # List of failure reasons
+            'pickup_attempts': 0,
+            'pickup_success': 0,
+            'pickup_failures': [],  # List of failure reasons
+            'drone_movements_per_step': defaultdict(int),
+        }
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1865,13 +1891,26 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     drone['batch_orders'].remove(order_id)
 
     def _force_complete_order(self, order_id, drone_id):
-        """强制完成订单（用于异常状态恢复）（走 StateManager）"""
+        """
+        Force-complete order for exceptional state recovery.
+        
+        This is called by _force_state_synchronization in exceptional cases:
+        1. Drone is IDLE/CHARGING with PICKED_UP order (drone completed trip but order not delivered)
+        2. Drone is RETURNING_TO_BASE with PICKED_UP order (drone returning with undelivered cargo)
+        
+        This can create "free deliveries" if called too frequently or inappropriately.
+        """
         if order_id not in self.orders:
             return
 
         order = self.orders[order_id]
         if order['status'] == OrderStatus.DELIVERED:
             return
+        
+        # Diagnostics: Track force-complete
+        self.dynamics_diagnostics['force_complete_calls'] += 1
+        if self.debug_env_dynamics:
+            print(f"[FORCE_COMPLETE] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} (status={order['status']})")
 
         self.state_manager.update_order_status(order_id, OrderStatus.DELIVERED, reason="force_complete")
         order['delivery_time'] = self.time_system.current_step
@@ -1896,7 +1935,15 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.completed_orders.add(order_id)
 
     def _force_state_synchronization(self):
-        """强制状态同步：确保订单与无人机状态一致，包括货物不变性"""
+        """Force state synchronization: ensure order and drone states are consistent, including cargo invariants"""
+        # Diagnostics: Track sync call
+        self.dynamics_diagnostics['force_sync_calls'] += 1
+        status_changes = 0
+        cargo_changes = 0
+        
+        # Helper to check if we should print debug messages
+        debug_enabled = self.debug_state_warnings or self.debug_env_dynamics
+        
         drone_real_orders = {d_id: set() for d_id in self.drones}
 
         for drone_id, drone in self.drones.items():
@@ -1928,8 +1975,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         if 'cargo' not in drone:
                             drone['cargo'] = set()
                         drone['cargo'].add(order_id)
-                        if self.debug_state_warnings:
-                            print(f"[Repair] 订单 {order_id} (PICKED_UP) 添加到无人机 {drone_id} 的货物中")
+                        cargo_changes += 1
+                        if debug_enabled:
+                            print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} (PICKED_UP) added to drone {drone_id} cargo")
 
         # Check all drones for invariant 2
         for drone_id, drone in self.drones.items():
@@ -1939,23 +1987,26 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order_id not in self.orders:
                     # Order doesn't exist - remove from cargo
                     invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 不存在，从无人机 {drone_id} 货物中移除")
+                    cargo_changes += 1
+                    if debug_enabled:
+                        print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} doesn't exist, removed from drone {drone_id} cargo")
                     continue
 
                 order = self.orders[order_id]
                 if order['status'] not in [OrderStatus.PICKED_UP]:
                     # Order status is not PICKED_UP - remove from cargo
                     invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 状态为 {order['status']}，从无人机 {drone_id} 货物中移除")
+                    cargo_changes += 1
+                    if debug_enabled:
+                        print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} status={order['status']}, removed from drone {drone_id} cargo")
                     continue
 
                 if order.get('assigned_drone', -1) != drone_id:
                     # Order not assigned to this drone - remove from cargo
                     invalid_cargo.append(order_id)
-                    if self.debug_state_warnings:
-                        print(f"[Repair] 订单 {order_id} 未分配给无人机 {drone_id}，从货物中移除")
+                    cargo_changes += 1
+                    if debug_enabled:
+                        print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} not assigned to drone {drone_id}, removed from cargo")
                     continue
 
             # Remove invalid cargo items
@@ -1975,6 +2026,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             if drone_id is None or drone_id < 0 or drone_id not in self.drones:
                 self._reset_order_to_ready(order_id, "invalid_drone_id")
+                status_changes += 1
                 continue
 
             drone = self.drones[drone_id]
@@ -1982,16 +2034,24 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if drone['status'] in [DroneStatus.IDLE, DroneStatus.CHARGING]:
                 if order_id not in drone_real_orders.get(drone_id, set()):
                     if order['status'] == OrderStatus.PICKED_UP:
+                        if self.debug_env_dynamics:
+                            print(f"[SYNC] Step {self.time_system.current_step}: Force-completing order {order_id} (drone {drone_id} is IDLE/CHARGING)")
                         self._force_complete_order(order_id, drone_id)
+                        status_changes += 1
                     else:
                         self._reset_order_to_ready(order_id, "drone_idle")
+                        status_changes += 1
                     continue
 
             if drone['status'] == DroneStatus.RETURNING_TO_BASE:
                 if order['status'] == OrderStatus.ASSIGNED:
                     self._reset_order_to_ready(order_id, "drone_returning")
+                    status_changes += 1
                 elif order['status'] == OrderStatus.PICKED_UP:
+                    if self.debug_env_dynamics:
+                        print(f"[SYNC] Step {self.time_system.current_step}: Force-completing order {order_id} (drone {drone_id} is RETURNING_TO_BASE)")
                     self._force_complete_order(order_id, drone_id)
+                    status_changes += 1
                 continue
 
             if drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
@@ -2004,12 +2064,16 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Don't auto-pickup in task-selection mode (serving_order_id present)
                     if drone.get('serving_order_id') is None:
                         if order['status'] == OrderStatus.ASSIGNED:
+                            if self.debug_env_dynamics:
+                                print(f"[SYNC] Step {self.time_system.current_step}: Auto-pickup order {order_id} (drone {drone_id} FLYING_TO_CUSTOMER, legacy mode)")
                             self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
                                                                    reason="sync_assigned_to_picked_up")
                             if 'pickup_time' not in order:
                                 order['pickup_time'] = self.time_system.current_step
                             # U7: Add to cargo to maintain invariant
                             drone['cargo'].add(order_id)
+                            status_changes += 1
+                            cargo_changes += 1
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -2034,6 +2098,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             order['status'] in [OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]):
                         actual_load += 1
             drone['current_load'] = actual_load
+        
+        # Diagnostics: Track changes
+        self.dynamics_diagnostics['force_sync_status_changes'] += status_changes
+        self.dynamics_diagnostics['force_sync_cargo_changes'] += cargo_changes
+        if self.debug_env_dynamics and (status_changes > 0 or cargo_changes > 0):
+            print(f"[SYNC] Step {self.time_system.current_step}: Total status_changes={status_changes}, cargo_changes={cargo_changes}")
 
     def _clear_drone_batch_state(self, drone):
         keys_to_remove = ['batch_orders', 'current_batch_index', 'current_delivery_index', 'waiting_start_time']
@@ -2802,6 +2872,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _update_drone_positions(self):
         # Sync drone status with route plan at the start of position update
         self._sync_drone_status_with_route()
+        
+        # Diagnostics: Reset movement counter for this step
+        current_step = self.time_system.current_step
+        self.dynamics_diagnostics['drone_movements_per_step'][current_step] = 0
 
         # U7: No longer use heading from action - move directly to target with speed multiplier only
         for drone_id, drone in self.drones.items():
@@ -2854,6 +2928,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     step_distance = float(math.sqrt((nx - cx) ** 2 + (ny - cy) ** 2))
 
                 drone["last_location"] = (nx, ny)
+                
+                # Diagnostics: Track drone movement
+                if step_distance > 1e-6:
+                    self.dynamics_diagnostics['drone_movements_per_step'][current_step] += 1
 
                 drone["total_distance_today"] = float(drone.get("total_distance_today", 0.0)) + step_distance
                 self.daily_stats["total_flight_distance"] = float(
@@ -2886,6 +2964,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
             elif drone["status"] == DroneStatus.CHARGING:
                 self._handle_charging(drone_id, drone)
+        
+        # Diagnostics: Check for double-movement (should be at most num_drones movements per step)
+        movements = self.dynamics_diagnostics['drone_movements_per_step'][current_step]
+        if self.debug_env_dynamics and movements > self.num_drones:
+            print(f"[MOVEMENT WARNING] Step {current_step}: {movements} drone movements detected (max expected: {self.num_drones})")
 
     # ------------------ 任务/到达处理（统一结算出口）------------------
     def _stop_to_location(self, stop: dict):
@@ -2960,15 +3043,35 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             o = self.orders.get(oid)
             if o is None:
                 continue
+            
+            # Diagnostics: Track pickup attempt
+            self.dynamics_diagnostics['pickup_attempts'] += 1
+            
+            # Check 1: Order must be assigned to this drone
             if o.get('assigned_drone', -1) != drone_id:
                 continue
+            
+            # Check 2: Order must belong to this merchant
             if o.get('merchant_id', None) != mid:
                 continue
+            
+            # Check 3: Order must be in ASSIGNED status (not READY, not PICKED_UP)
             if o['status'] != OrderStatus.ASSIGNED:
+                failure_reason = f"order_status={o['status']} (not ASSIGNED)"
+                self.dynamics_diagnostics['pickup_failures'].append(failure_reason)
+                if self.debug_env_dynamics:
+                    print(f"[PICKUP FAILED] Step {self.time_system.current_step}: Order {oid} at merchant {mid} by drone {drone_id} - {failure_reason}")
                 continue
-
+            
+            # All checks passed - proceed with pickup
+            self.dynamics_diagnostics['pickup_success'] += 1
+            if self.debug_env_dynamics:
+                print(f"[PICKUP SUCCESS] Step {self.time_system.current_step}: Order {oid} at merchant {mid} by drone {drone_id} (status=ASSIGNED)")
+            
             self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP, reason=f"pickup_at_merchant_{mid}")
             o['pickup_time'] = self.time_system.current_step
+            
+            # Ensure cargo add happens
             drone['cargo'].add(oid)
 
     def _execute_delivery_stop(self, drone_id: int, drone: dict, stop: dict) -> None:
@@ -3294,6 +3397,41 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         order = self.orders[order_id]
         if order['status'] == OrderStatus.DELIVERED:
             return
+        
+        # Diagnostics: Track delivery attempt
+        self.dynamics_diagnostics['delivery_attempts'] += 1
+        
+        # Strict invariant checks: order must be PICKED_UP, assigned to this drone, and in drone cargo
+        drone = self.drones.get(drone_id)
+        
+        # Check 1: Order status must be PICKED_UP
+        if order['status'] != OrderStatus.PICKED_UP:
+            failure_reason = f"order_status={order['status']} (not PICKED_UP)"
+            self.dynamics_diagnostics['delivery_failures'].append(failure_reason)
+            if self.debug_env_dynamics:
+                print(f"[DELIVERY FAILED] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} - {failure_reason}")
+            return
+        
+        # Check 2: Order must be assigned to this drone
+        if order.get('assigned_drone') != drone_id:
+            failure_reason = f"assigned_drone={order.get('assigned_drone')} (not {drone_id})"
+            self.dynamics_diagnostics['delivery_failures'].append(failure_reason)
+            if self.debug_env_dynamics:
+                print(f"[DELIVERY FAILED] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} - {failure_reason}")
+            return
+        
+        # Check 3: Order must be in drone cargo
+        if drone and order_id not in drone.get('cargo', set()):
+            failure_reason = f"order not in drone cargo"
+            self.dynamics_diagnostics['delivery_failures'].append(failure_reason)
+            if self.debug_env_dynamics:
+                print(f"[DELIVERY FAILED] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} - {failure_reason}")
+            return
+        
+        # All checks passed - proceed with delivery
+        self.dynamics_diagnostics['delivery_success'] += 1
+        if self.debug_env_dynamics:
+            print(f"[DELIVERY SUCCESS] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} (status=PICKED_UP, cargo=✓)")
 
         self.state_manager.update_order_status(order_id, OrderStatus.DELIVERED, reason=f"delivered_by_drone_{drone_id}")
         order['delivery_time'] = self.time_system.current_step
@@ -3682,19 +3820,28 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _cleanup_stale_assignments(self):
         current_step = self.time_system.current_step
         stale_threshold = 50
+        
+        # Diagnostics: Track cleanup call
+        self.dynamics_diagnostics['cleanup_calls'] += 1
+        cancellations_this_call = 0
 
         for order_id, order in list(self.orders.items()):
             # Check for READY-based timeout cancellation
             if order['status'] in [OrderStatus.READY, OrderStatus.ASSIGNED, OrderStatus.PICKED_UP]:
                 deadline_step = self._get_delivery_deadline_step(order)
                 if current_step > deadline_step:
+                    if self.debug_env_dynamics:
+                        print(f"[CLEANUP] Step {current_step}: Cancelling order {order_id} (status={order['status']}, deadline_step={deadline_step})")
                     self._cancel_order(order_id, "ready_based_timeout")
+                    cancellations_this_call += 1
                     continue
 
             if order['status'] == OrderStatus.ASSIGNED:
                 drone_id = order.get('assigned_drone', -1)
 
                 if drone_id < 0 or drone_id not in self.drones:
+                    if self.debug_env_dynamics:
+                        print(f"[CLEANUP] Step {current_step}: Resetting order {order_id} to READY (invalid drone {drone_id})")
                     self._reset_order_to_ready(order_id, "stale_invalid_drone")
                     continue
 
@@ -3703,7 +3850,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if drone['status'] in [DroneStatus.IDLE, DroneStatus.CHARGING]:
                     age = current_step - order['creation_time']
                     if age > stale_threshold:
+                        if self.debug_env_dynamics:
+                            print(f"[CLEANUP] Step {current_step}: Resetting order {order_id} to READY (stale age={age})")
                         self._reset_order_to_ready(order_id, "stale_age")
+        
+        # Diagnostics: Track cancellations
+        self.dynamics_diagnostics['cleanup_cancellations'] += cancellations_this_call
+        if self.debug_env_dynamics and cancellations_this_call > 0:
+            print(f"[CLEANUP] Step {current_step}: Total cancellations this call: {cancellations_this_call}")
 
     # ------------------ end-of-day ------------------
 
@@ -4084,4 +4238,79 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'weather_battery_factor': self._get_weather_battery_factor(),
         }
         return constraints
+
+    def print_dynamics_diagnostics(self):
+        """
+        Print diagnostics summary for environment dynamics.
+        Useful for debugging and understanding environment behavior.
+        """
+        diag = self.dynamics_diagnostics
+        print("\n" + "="*80)
+        print("ENVIRONMENT DYNAMICS DIAGNOSTICS")
+        print("="*80)
+        
+        # Cleanup statistics
+        print(f"\n[CLEANUP STALE ASSIGNMENTS]")
+        print(f"  Total calls: {diag['cleanup_calls']}")
+        print(f"  Total cancellations: {diag['cleanup_cancellations']}")
+        if diag['cleanup_calls'] > 0:
+            print(f"  Avg cancellations/call: {diag['cleanup_cancellations']/diag['cleanup_calls']:.2f}")
+        
+        # Force sync statistics
+        print(f"\n[FORCE STATE SYNCHRONIZATION]")
+        print(f"  Total calls: {diag['force_sync_calls']}")
+        print(f"  Total status changes: {diag['force_sync_status_changes']}")
+        print(f"  Total cargo changes: {diag['force_sync_cargo_changes']}")
+        print(f"  Force-complete calls: {diag['force_complete_calls']}")
+        if diag['force_sync_calls'] > 0:
+            print(f"  Avg status changes/call: {diag['force_sync_status_changes']/diag['force_sync_calls']:.2f}")
+            print(f"  Avg cargo changes/call: {diag['force_sync_cargo_changes']/diag['force_sync_calls']:.2f}")
+        if diag['force_complete_calls'] > 0:
+            completed = self.daily_stats.get('orders_completed', 0)
+            if completed > 0:
+                force_pct = (diag['force_complete_calls'] / completed) * 100
+                print(f"  Force-complete as % of deliveries: {force_pct:.1f}%")
+                if force_pct > FORCE_COMPLETE_WARNING_THRESHOLD:
+                    print(f"  WARNING: High force-complete rate suggests environment issues!")
+        
+        # Delivery statistics
+        print(f"\n[ORDER DELIVERIES]")
+        print(f"  Total attempts: {diag['delivery_attempts']}")
+        print(f"  Successful: {diag['delivery_success']}")
+        print(f"  Failed: {len(diag['delivery_failures'])}")
+        if diag['delivery_attempts'] > 0:
+            success_rate = (diag['delivery_success'] / diag['delivery_attempts']) * 100
+            print(f"  Success rate: {success_rate:.1f}%")
+        if diag['delivery_failures']:
+            print(f"  Recent failures (last 10):")
+            for failure in diag['delivery_failures'][-10:]:
+                print(f"    - {failure}")
+        
+        # Pickup statistics
+        print(f"\n[ORDER PICKUPS]")
+        print(f"  Total attempts: {diag['pickup_attempts']}")
+        print(f"  Successful: {diag['pickup_success']}")
+        print(f"  Failed: {len(diag['pickup_failures'])}")
+        if diag['pickup_attempts'] > 0:
+            success_rate = (diag['pickup_success'] / diag['pickup_attempts']) * 100
+            print(f"  Success rate: {success_rate:.1f}%")
+        if diag['pickup_failures']:
+            print(f"  Recent failures (last 10):")
+            for failure in diag['pickup_failures'][-10:]:
+                print(f"    - {failure}")
+        
+        # Movement statistics
+        print(f"\n[DRONE MOVEMENTS]")
+        if diag['drone_movements_per_step']:
+            movements_list = list(diag['drone_movements_per_step'].values())
+            avg_movements = sum(movements_list) / len(movements_list)
+            max_movements = max(movements_list)
+            print(f"  Avg movements/step: {avg_movements:.1f}")
+            print(f"  Max movements/step: {max_movements}")
+            print(f"  Expected max: {self.num_drones}")
+            if max_movements > self.num_drones:
+                print(f"  WARNING: Double-movement detected!")
+        
+        print("\n" + "="*80)
+
 
