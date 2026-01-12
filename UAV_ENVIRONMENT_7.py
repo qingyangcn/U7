@@ -1093,6 +1093,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  timeout_factor: float = 4.0,  # Multiplier for deadline calculation
                  # ===== U7: Task selection parameters =====
                  num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
+                 # ===== Diagnostics parameters =====
+                 debug_diagnostics: bool = False,  # Enable diagnostic tracking and logging
                  ):
         super().__init__()
 
@@ -1126,6 +1128,36 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
         self.timeout_factor = float(timeout_factor)  # Deadline multiplier
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
+        
+        # ========== Diagnostic tracking ==========
+        self.debug_diagnostics = bool(debug_diagnostics)
+        self.diagnostics = {
+            # Movement path counters
+            'immediate_position_updates': 0,
+            'event_position_updates': 0,
+            'immediate_arrivals': 0,
+            'event_arrivals': 0,
+            
+            # Arrival handler branch counters
+            'arrival_route_mode': 0,
+            'arrival_tasksel_mode': 0,
+            'arrival_legacy_mode': 0,
+            
+            # State sync repair counters
+            'sync_assigned_to_picked_up': 0,
+            'sync_force_complete': 0,
+            'sync_reset_to_ready': 0,
+            'cargo_repairs_add': 0,
+            'cargo_repairs_remove': 0,
+            
+            # Order preparation paths
+            'immediate_prep_transitions': 0,
+            'event_prep_transitions': 0,
+            
+            # Order status snapshots (taken every 64 steps)
+            'order_status_snapshots': [],
+        }
+        
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1596,6 +1628,27 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._assigned_in_step = set()
         self.pending_distance_reward = 0.0
         self._end_of_day_printed = False
+        
+        # ========== Reset diagnostics ==========
+        if self.debug_diagnostics:
+            self.diagnostics = {
+                'immediate_position_updates': 0,
+                'event_position_updates': 0,
+                'immediate_arrivals': 0,
+                'event_arrivals': 0,
+                'arrival_route_mode': 0,
+                'arrival_tasksel_mode': 0,
+                'arrival_legacy_mode': 0,
+                'sync_assigned_to_picked_up': 0,
+                'sync_force_complete': 0,
+                'sync_reset_to_ready': 0,
+                'cargo_repairs_add': 0,
+                'cargo_repairs_remove': 0,
+                'immediate_prep_transitions': 0,
+                'event_prep_transitions': 0,
+                'order_status_snapshots': [],
+            }
+        
         # ====== 多目标权重：每个 episode 一个偏好 ======
         if self.multi_objective_mode == "conditioned":
             w = np.random.dirichlet(alpha=np.ones(self.num_objectives)).astype(np.float32)
@@ -1656,6 +1709,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # 强制状态同步
         self._force_state_synchronization()
 
+        # ========== Diagnostic: Order status snapshot every 64 steps ==========
+        if self.debug_diagnostics and self.time_system.current_step % 64 == 0:
+            snapshot = self._collect_order_status_snapshot()
+            self.diagnostics['order_status_snapshots'].append(snapshot)
+            if self.debug_state_warnings:
+                print(f"[Step {self.time_system.current_step}] Order status: {snapshot}")
+
         # 更新系统状态（扩展点）
         self._update_system_state()
 
@@ -1687,6 +1747,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if not getattr(self, "_end_of_day_printed", False):
                 self._handle_end_of_day()
                 self._end_of_day_printed = True
+
+            # ========== Diagnostic: Print episode summary ==========
+            if self.debug_diagnostics:
+                self._print_diagnostic_summary()
 
             final_bonus = self._calculate_daily_final_bonus()
             r_vec = r_vec + final_bonus
@@ -1835,6 +1899,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if order_id not in self.orders:
             return
 
+        if self.debug_diagnostics:
+            self.diagnostics['sync_reset_to_ready'] += 1
+
         order = self.orders[order_id]
         old_drone = order.get('assigned_drone', -1)
 
@@ -1851,6 +1918,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """强制完成订单（用于异常状态恢复）（走 StateManager）"""
         if order_id not in self.orders:
             return
+
+        if self.debug_diagnostics:
+            self.diagnostics['sync_force_complete'] += 1
 
         order = self.orders[order_id]
         if order['status'] == OrderStatus.DELIVERED:
@@ -1904,6 +1974,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     drone = self.drones[drone_id]
                     if order_id not in drone.get('cargo', set()):
                         # Repair: add to cargo
+                        if self.debug_diagnostics:
+                            self.diagnostics['cargo_repairs_add'] += 1
                         if 'cargo' not in drone:
                             drone['cargo'] = set()
                         drone['cargo'].add(order_id)
@@ -1918,6 +1990,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order_id not in self.orders:
                     # Order doesn't exist - remove from cargo
                     invalid_cargo.append(order_id)
+                    if self.debug_diagnostics:
+                        self.diagnostics['cargo_repairs_remove'] += 1
                     if self.debug_state_warnings:
                         print(f"[Repair] 订单 {order_id} 不存在，从无人机 {drone_id} 货物中移除")
                     continue
@@ -1926,6 +2000,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order['status'] not in [OrderStatus.PICKED_UP]:
                     # Order status is not PICKED_UP - remove from cargo
                     invalid_cargo.append(order_id)
+                    if self.debug_diagnostics:
+                        self.diagnostics['cargo_repairs_remove'] += 1
                     if self.debug_state_warnings:
                         print(f"[Repair] 订单 {order_id} 状态为 {order['status']}，从无人机 {drone_id} 货物中移除")
                     continue
@@ -1933,6 +2009,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order.get('assigned_drone', -1) != drone_id:
                     # Order not assigned to this drone - remove from cargo
                     invalid_cargo.append(order_id)
+                    if self.debug_diagnostics:
+                        self.diagnostics['cargo_repairs_remove'] += 1
                     if self.debug_state_warnings:
                         print(f"[Repair] 订单 {order_id} 未分配给无人机 {drone_id}，从货物中移除")
                     continue
@@ -1983,6 +2061,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Don't auto-pickup in task-selection mode (serving_order_id present)
                     if drone.get('serving_order_id') is None:
                         if order['status'] == OrderStatus.ASSIGNED:
+                            if self.debug_diagnostics:
+                                self.diagnostics['sync_assigned_to_picked_up'] += 1
                             self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
                                                                    reason="sync_assigned_to_picked_up")
                             if 'pickup_time' not in order:
@@ -2588,6 +2668,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self._update_merchant_preparation_immediately()
 
     def _update_drone_positions_immediately(self):
+        if self.debug_diagnostics:
+            self.diagnostics['immediate_position_updates'] += 1
+        
         for drone_id, drone in self.drones.items():
             if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT,
                                    DroneStatus.FLYING_TO_CUSTOMER,
@@ -2617,6 +2700,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             new_distance = math.sqrt((target_loc[0] - new_x) ** 2 +
                                                      (target_loc[1] - new_y) ** 2)
                             if new_distance < 0.1:
+                                if self.debug_diagnostics:
+                                    self.diagnostics['immediate_arrivals'] += 1
                                 self._handle_drone_arrival(drone_id, drone)
 
     def _update_merchant_preparation_immediately(self):
@@ -2636,6 +2721,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             order_id, OrderStatus.READY, reason="immediate_preparation"
                         )
                         ready_orders.append(order_id)
+                        if self.debug_diagnostics:
+                            self.diagnostics['immediate_prep_transitions'] += 1
 
             for order_id in ready_orders:
                 if order_id in merchant['queue']:
@@ -2716,6 +2803,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             order_id, OrderStatus.READY, reason="preparation_complete"
                         )
                         ready_orders.append(order_id)
+                        if self.debug_diagnostics:
+                            self.diagnostics['event_prep_transitions'] += 1
 
             for order_id in ready_orders:
                 if order_id in merchant['queue']:
@@ -2761,6 +2850,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _update_drone_positions(self):
         # Sync drone status with route plan at the start of position update
         self._sync_drone_status_with_route()
+        
+        if self.debug_diagnostics:
+            self.diagnostics['event_position_updates'] += 1
 
         headings = getattr(self, "_last_route_heading", None)
 
@@ -2864,6 +2956,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 new_dist = float(math.sqrt((tx - nx) ** 2 + (ty - ny) ** 2))
                 if new_dist <= ARRIVAL_THRESHOLD:
                     drone["location"] = (tx, ty)
+                    if self.debug_diagnostics:
+                        self.diagnostics['event_arrivals'] += 1
                     self._handle_drone_arrival(drone_id, drone)
 
                 battery_consumption = float(drone["battery_consumption_rate"]) * float(
@@ -3090,6 +3184,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         """
         # -------- New route-plan logic (priority) --------
         if drone.get('planned_stops') and len(drone['planned_stops']) > 0:
+            if self.debug_diagnostics:
+                self.diagnostics['arrival_route_mode'] += 1
             stop = drone['planned_stops'][0]
             stype = stop.get('type', None)
 
@@ -3110,6 +3206,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # -------- Task-selection mode logic (U7) --------
         serving_order_id = drone.get('serving_order_id')
         if serving_order_id is not None and serving_order_id in self.orders:
+            if self.debug_diagnostics:
+                self.diagnostics['arrival_tasksel_mode'] += 1
             order = self.orders[serving_order_id]
 
             if drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
@@ -3166,6 +3264,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             return
 
         # -------- Legacy logic (batch orders) --------
+        if self.debug_diagnostics:
+            self.diagnostics['arrival_legacy_mode'] += 1
         if drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
             if 'batch_orders' in drone and drone['batch_orders']:
                 self._handle_batch_pickup(drone_id, drone)
@@ -3977,6 +4077,126 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 status_count['charging'] += 1
 
         return status_count
+
+    # ------------------ Diagnostic Helpers ------------------
+
+    def _collect_order_status_snapshot(self):
+        """Collect a snapshot of order counts by status."""
+        status_counts = {
+            'PENDING': 0,
+            'ACCEPTED': 0,
+            'PREPARING': 0,
+            'READY': 0,
+            'ASSIGNED': 0,
+            'PICKED_UP': 0,
+            'DELIVERED': 0,
+            'CANCELLED': 0,
+        }
+        
+        for order_id in self.active_orders:
+            if order_id not in self.orders:
+                continue
+            order = self.orders[order_id]
+            status_name = order['status'].name
+            if status_name in status_counts:
+                status_counts[status_name] += 1
+        
+        # Also count completed and cancelled from historical sets
+        status_counts['DELIVERED'] = len(self.completed_orders)
+        status_counts['CANCELLED'] = len(self.cancelled_orders)
+        
+        snapshot = {
+            'step': self.time_system.current_step,
+            'counts': status_counts,
+        }
+        return snapshot
+
+    def _print_diagnostic_summary(self):
+        """Print diagnostic summary at end of episode."""
+        print("\n" + "=" * 70)
+        print("DIAGNOSTIC SUMMARY - Episode Ended")
+        print("=" * 70)
+        
+        # Movement path diagnostics
+        print("\n[1] Movement/Position Update Paths:")
+        print(f"  - Immediate position updates:    {self.diagnostics['immediate_position_updates']}")
+        print(f"  - Event-based position updates:  {self.diagnostics['event_position_updates']}")
+        print(f"  - Immediate arrivals triggered:  {self.diagnostics['immediate_arrivals']}")
+        print(f"  - Event-based arrivals triggered: {self.diagnostics['event_arrivals']}")
+        
+        total_immediate = self.diagnostics['immediate_position_updates']
+        total_event = self.diagnostics['event_position_updates']
+        if total_immediate > 0 and total_event > 0:
+            print(f"  ⚠️  ISSUE: Both immediate and event-based movement paths active!")
+            print(f"     This can cause drones to move twice per step or use different arrival thresholds.")
+        
+        # Arrival handler branch diagnostics
+        print("\n[2] Arrival Handler Branch Usage:")
+        print(f"  - Route-plan mode arrivals:      {self.diagnostics['arrival_route_mode']}")
+        print(f"  - Task-selection mode arrivals:  {self.diagnostics['arrival_tasksel_mode']}")
+        print(f"  - Legacy mode arrivals:          {self.diagnostics['arrival_legacy_mode']}")
+        
+        modes_active = sum(1 for x in [
+            self.diagnostics['arrival_route_mode'],
+            self.diagnostics['arrival_tasksel_mode'],
+            self.diagnostics['arrival_legacy_mode']
+        ] if x > 0)
+        
+        if modes_active > 1:
+            print(f"  ⚠️  ISSUE: Multiple arrival handler modes used in same episode!")
+            print(f"     Different modes may have conflicting task assignment logic.")
+        
+        # State sync repair diagnostics
+        print("\n[3] State Synchronization Repairs:")
+        print(f"  - Auto ASSIGNED->PICKED_UP:      {self.diagnostics['sync_assigned_to_picked_up']}")
+        print(f"  - Force-complete orders:         {self.diagnostics['sync_force_complete']}")
+        print(f"  - Reset-to-READY orders:         {self.diagnostics['sync_reset_to_ready']}")
+        print(f"  - Cargo repairs (add):           {self.diagnostics['cargo_repairs_add']}")
+        print(f"  - Cargo repairs (remove):        {self.diagnostics['cargo_repairs_remove']}")
+        
+        total_repairs = (
+            self.diagnostics['sync_assigned_to_picked_up'] +
+            self.diagnostics['sync_force_complete'] +
+            self.diagnostics['sync_reset_to_ready'] +
+            self.diagnostics['cargo_repairs_add'] +
+            self.diagnostics['cargo_repairs_remove']
+        )
+        
+        if total_repairs > 0:
+            print(f"  ⚠️  ISSUE: {total_repairs} state repairs performed!")
+            print(f"     Auto-pickup/auto-complete may make evaluation unreliable.")
+        
+        # Order preparation paths
+        print("\n[4] Order Preparation/READY Transition Paths:")
+        print(f"  - Immediate prep transitions:    {self.diagnostics['immediate_prep_transitions']}")
+        print(f"  - Event-based prep transitions:  {self.diagnostics['event_prep_transitions']}")
+        
+        if self.diagnostics['immediate_prep_transitions'] > 0 and self.diagnostics['event_prep_transitions'] > 0:
+            print(f"  ⚠️  ISSUE: Both immediate and event-based preparation paths active!")
+            print(f"     Different transition logic may prevent orders from becoming READY.")
+        
+        # Order status progression
+        print("\n[5] Order Status Snapshot Summary:")
+        if self.diagnostics['order_status_snapshots']:
+            print(f"  - Snapshots collected: {len(self.diagnostics['order_status_snapshots'])}")
+            # Show first and last snapshot
+            first = self.diagnostics['order_status_snapshots'][0]
+            last = self.diagnostics['order_status_snapshots'][-1]
+            print(f"  - First snapshot (step {first['step']}): {first['counts']}")
+            print(f"  - Last snapshot (step {last['step']}): {last['counts']}")
+            
+            # Check if READY orders are appearing
+            ready_counts = [s['counts']['READY'] for s in self.diagnostics['order_status_snapshots']]
+            max_ready = max(ready_counts) if ready_counts else 0
+            if max_ready == 0:
+                print(f"  ⚠️  ISSUE: No READY orders observed in any snapshot!")
+                print(f"     Orders may not be transitioning to READY status.")
+        else:
+            print(f"  - No snapshots collected (episode too short or debug not enabled)")
+        
+        print("\n" + "=" * 70)
+        print("END DIAGNOSTIC SUMMARY")
+        print("=" * 70 + "\n")
 
     # ------------------ Snapshot interfaces for MOPSO ------------------
 
