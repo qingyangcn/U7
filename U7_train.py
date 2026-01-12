@@ -207,6 +207,27 @@ class MOPSOAssignWrapper(gym.Wrapper):
                     
         return None
         
+    def _apply_fallback_sanitization(
+        self,
+        drone_id: int,
+        candidate_list: list,
+        sanitized_action: np.ndarray,
+        num_candidates: int
+    ) -> None:
+        """
+        Apply fallback candidate selection and sanitize action for a single drone.
+        
+        Updates sanitized_action in-place and increments stats.
+        """
+        self.stats['ppo_invalid_choices'] += 1
+        fallback_idx = self._get_fallback_candidate_idx(drone_id, candidate_list)
+        if fallback_idx is not None:
+            self.stats['fallback_used'] += 1
+            # Sanitize action: replace choice_raw with center-of-bin for fallback choice
+            # Map fallback_idx back to [-1, 1] range (center of bin)
+            new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
+            sanitized_action[drone_id, 0] = new_choice_raw
+    
     def _apply_fallback_and_sanitize_action(self, action: np.ndarray) -> np.ndarray:
         """
         Apply fallback policy for drones with invalid PPO choices and sanitize action.
@@ -249,29 +270,16 @@ class MOPSOAssignWrapper(gym.Wrapper):
                 num_candidates - 1
             )
             
-            # Check if PPO choice is valid
+            # Check if PPO choice index is out of bounds
             if choice_idx >= len(candidate_list):
-                self.stats['ppo_invalid_choices'] += 1
-                fallback_idx = self._get_fallback_candidate_idx(drone_id, candidate_list)
-                if fallback_idx is not None:
-                    self.stats['fallback_used'] += 1
-                    # Sanitize action: replace choice_raw with center-of-bin for fallback choice
-                    # Map fallback_idx back to [-1, 1] range (center of bin)
-                    new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
-                    sanitized_action[drone_id, 0] = new_choice_raw
+                self._apply_fallback_sanitization(drone_id, candidate_list, sanitized_action, num_candidates)
                 continue
                 
             order_id, is_valid = candidate_list[choice_idx]
             
-            # Check if PPO choice is invalid
+            # Check if PPO choice points to invalid candidate
             if not is_valid or order_id < 0 or order_id not in env.orders:
-                self.stats['ppo_invalid_choices'] += 1
-                fallback_idx = self._get_fallback_candidate_idx(drone_id, candidate_list)
-                if fallback_idx is not None:
-                    self.stats['fallback_used'] += 1
-                    # Sanitize action: replace choice_raw with center-of-bin for fallback choice
-                    new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
-                    sanitized_action[drone_id, 0] = new_choice_raw
+                self._apply_fallback_sanitization(drone_id, candidate_list, sanitized_action, num_candidates)
                     
         return sanitized_action
         
@@ -281,11 +289,7 @@ class MOPSOAssignWrapper(gym.Wrapper):
             return
             
         valid_frac = self.stats['drones_with_valid_candidates'] / self.stats['total_drones_checked']
-        
-        if self.stats['total_drones_checked'] > 0:
-            invalid_frac = self.stats['ppo_invalid_choices'] / self.stats['total_drones_checked']
-        else:
-            invalid_frac = 0.0
+        invalid_frac = self.stats['ppo_invalid_choices'] / self.stats['total_drones_checked']
             
         cargo_frac = 0.0
         cargo_first_frac = 0.0
