@@ -91,7 +91,7 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
     """
     Preferred assignment-only path.
 
-    If U7_mopso_dispatcher.py defines apply_mopso_assignment(env, planner), use it.
+    If U7_mopso_dispatcher.py defines apply_mopso_assignment, use it.
     Otherwise:
       - Run planner.mopso_dispatch(env) to get plans, but DO NOT apply planned_stops.
       - Instead, extract commit_orders and call env._process_single_assignment for each.
@@ -102,8 +102,9 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
         from U7_mopso_dispatcher import apply_mopso_assignment  # type: ignore
         # If import succeeds and callable exists, use it.
         if callable(apply_mopso_assignment):
+            # Pass None for assigner - function will create U7MOPSOAssigner internally
             # expected to do READY->ASSIGNED without installing planned_stops
-            res = apply_mopso_assignment(env, planner)
+            res = apply_mopso_assignment(env, assigner=None)
             # allow either int or dict return
             if isinstance(res, int):
                 return res
@@ -290,11 +291,10 @@ class MOPSOAssignWrapper(gym.Wrapper):
             
         valid_frac = self.stats['drones_with_valid_candidates'] / self.stats['total_drones_checked']
         invalid_frac = self.stats['ppo_invalid_choices'] / self.stats['total_drones_checked']
+        cargo_frac = self.stats['drones_with_cargo'] / self.stats['total_drones_checked']
             
-        cargo_frac = 0.0
         cargo_first_frac = 0.0
         if self.stats['drones_with_cargo'] > 0:
-            cargo_frac = self.stats['drones_with_cargo'] / self.stats['total_drones_checked']
             cargo_first_frac = self.stats['cargo_first_applied'] / self.stats['drones_with_cargo']
         
         print(f"\n[Step {self.step_count}] Debug Stats:")
@@ -384,7 +384,8 @@ def train(args):
     except ImportError as e:
         raise RuntimeError("Please install stable-baselines3: pip install stable-baselines3") from e
 
-    if args.log_dir:
+    # Create log directory if specified and not None
+    if args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.model_dir, exist_ok=True)
 
