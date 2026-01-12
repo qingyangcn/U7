@@ -1140,6 +1140,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'force_sync_calls': 0,
             'force_sync_status_changes': 0,
             'force_sync_cargo_changes': 0,
+            'force_complete_calls': 0,  # Track force_complete_order calls
             'delivery_attempts': 0,
             'delivery_success': 0,
             'delivery_failures': [],  # List of failure reasons
@@ -1887,13 +1888,26 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     drone['batch_orders'].remove(order_id)
 
     def _force_complete_order(self, order_id, drone_id):
-        """强制完成订单（用于异常状态恢复）（走 StateManager）"""
+        """
+        强制完成订单（用于异常状态恢复）（走 StateManager）
+        
+        This is called by _force_state_synchronization in exceptional cases:
+        1. Drone is IDLE/CHARGING with PICKED_UP order (drone completed trip but order not delivered)
+        2. Drone is RETURNING_TO_BASE with PICKED_UP order (drone returning with undelivered cargo)
+        
+        This can create "free deliveries" if called too frequently or inappropriately.
+        """
         if order_id not in self.orders:
             return
 
         order = self.orders[order_id]
         if order['status'] == OrderStatus.DELIVERED:
             return
+        
+        # Diagnostics: Track force-complete
+        self.dynamics_diagnostics['force_complete_calls'] += 1
+        if self.debug_env_dynamics:
+            print(f"[FORCE_COMPLETE] Step {self.time_system.current_step}: Order {order_id} by drone {drone_id} (status={order['status']})")
 
         self.state_manager.update_order_status(order_id, OrderStatus.DELIVERED, reason="force_complete")
         order['delivery_time'] = self.time_system.current_step
@@ -4241,9 +4255,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"  Total calls: {diag['force_sync_calls']}")
         print(f"  Total status changes: {diag['force_sync_status_changes']}")
         print(f"  Total cargo changes: {diag['force_sync_cargo_changes']}")
+        print(f"  Force-complete calls: {diag['force_complete_calls']}")
         if diag['force_sync_calls'] > 0:
             print(f"  Avg status changes/call: {diag['force_sync_status_changes']/diag['force_sync_calls']:.2f}")
             print(f"  Avg cargo changes/call: {diag['force_sync_cargo_changes']/diag['force_sync_calls']:.2f}")
+        if diag['force_complete_calls'] > 0:
+            completed = self.daily_stats.get('orders_completed', 0)
+            if completed > 0:
+                force_pct = (diag['force_complete_calls'] / completed) * 100
+                print(f"  Force-complete as % of deliveries: {force_pct:.1f}%")
+                if force_pct > 10:
+                    print(f"  WARNING: High force-complete rate suggests environment issues!")
         
         # Delivery statistics
         print(f"\n[ORDER DELIVERIES]")
