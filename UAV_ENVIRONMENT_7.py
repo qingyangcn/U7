@@ -1457,7 +1457,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         Priority:
         1. Orders in drone cargo (PICKED_UP) assigned to this drone
         2. Orders ASSIGNED to this drone but not yet picked up
-        3. Padding with (-1, False) for invalid slots
+        3. Orders READY and unassigned (available for pickup)
+        4. Padding with (-1, False) for invalid slots
 
         Returns:
             List of (order_id, is_valid) tuples, always length K
@@ -1482,7 +1483,17 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order['status'] == OrderStatus.ASSIGNED and oid not in cargo_orders:
                     candidates.append((oid, True))
 
-        # 3. Pad with invalid entries
+        # 3. Orders READY and unassigned (available for selection)
+        for oid in self.active_orders:
+            if len(candidates) >= self.num_candidates:
+                break
+            order = self.orders.get(oid)
+            if order and order['status'] == OrderStatus.READY:
+                assigned_drone = order.get('assigned_drone', -1)
+                if assigned_drone in (-1, None):
+                    candidates.append((oid, True))
+
+        # 4. Pad with invalid entries
         while len(candidates) < self.num_candidates:
             candidates.append((-1, False))
 
@@ -1644,7 +1655,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         shaping_vec = self._calculate_shaping_reward(action)
         r_vec = r_vec + shaping_vec
         self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
-        # 动作后立即更新
+        # U7: Disabled drone position updates in _immediate_state_update()
+        # to prevent double movement. Drones now move only once per step
+        # via _update_drone_positions() in _process_events().
         self._immediate_state_update()
 
         # 动态事件
@@ -1842,10 +1855,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         order['assigned_drone'] = -1
 
         if old_drone is not None and old_drone >= 0 and old_drone in self.drones:
-            self.drones[old_drone]['current_load'] = max(0, self.drones[old_drone]['current_load'] - 1)
-            if 'batch_orders' in self.drones[old_drone]:
-                if order_id in self.drones[old_drone]['batch_orders']:
-                    self.drones[old_drone]['batch_orders'].remove(order_id)
+            drone = self.drones[old_drone]
+            drone['current_load'] = max(0, drone['current_load'] - 1)
+            # U7: Remove from cargo when resetting to READY
+            if order_id in drone.get('cargo', set()):
+                drone['cargo'].remove(order_id)
+            if 'batch_orders' in drone:
+                if order_id in drone['batch_orders']:
+                    drone['batch_orders'].remove(order_id)
 
     def _force_complete_order(self, order_id, drone_id):
         """强制完成订单（用于异常状态恢复）（走 StateManager）"""
@@ -1861,8 +1878,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         order['assigned_drone'] = -1
 
         if drone_id in self.drones:
-            self.drones[drone_id]['orders_completed'] += 1
-            self.drones[drone_id]['current_load'] = max(0, self.drones[drone_id]['current_load'] - 1)
+            drone = self.drones[drone_id]
+            drone['orders_completed'] += 1
+            drone['current_load'] = max(0, drone['current_load'] - 1)
+            # U7: Remove from cargo when forcing completion
+            if order_id in drone.get('cargo', set()):
+                drone['cargo'].remove(order_id)
 
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
@@ -1987,6 +2008,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                                                                    reason="sync_assigned_to_picked_up")
                             if 'pickup_time' not in order:
                                 order['pickup_time'] = self.time_system.current_step
+                            # U7: Add to cargo to maintain invariant
+                            drone['cargo'].add(order_id)
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -2150,6 +2173,21 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     )
             elif order['status'] == OrderStatus.ASSIGNED:
                 # Order assigned but not picked up -> go to merchant
+                merchant_id = order.get('merchant_id')
+                if merchant_id and merchant_id in self.merchants:
+                    merchant_loc = self.merchants[merchant_id]['location']
+                    drone['target_location'] = merchant_loc
+                    drone['current_merchant_id'] = merchant_id
+                    self.state_manager.update_drone_status(
+                        drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
+                    )
+            elif order['status'] == OrderStatus.READY:
+                # U7: Order is READY - need to assign it to this drone first
+                order['assigned_drone'] = drone_id
+                self.state_manager.update_order_status(
+                    order_id, OrderStatus.ASSIGNED, reason=f"task_selection_by_drone_{drone_id}"
+                )
+                # Then go to merchant
                 merchant_id = order.get('merchant_id')
                 if merchant_id and merchant_id in self.merchants:
                     merchant_loc = self.merchants[merchant_id]['location']
@@ -2584,7 +2622,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     # ------------------ 事件处理与移动 ------------------
 
     def _immediate_state_update(self):
-        self._update_drone_positions_immediately()
+        # U7: Disabled _update_drone_positions_immediately() to prevent double movement.
+        # Drones now only move once per step via _update_drone_positions() in _process_events().
+        # TODO: This commented code can be removed after thorough testing confirms single movement works correctly.
+        # self._update_drone_positions_immediately()
         self._update_merchant_preparation_immediately()
 
     def _update_drone_positions_immediately(self):
@@ -2762,8 +2803,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Sync drone status with route plan at the start of position update
         self._sync_drone_status_with_route()
 
-        headings = getattr(self, "_last_route_heading", None)
-
+        # U7: No longer use heading from action - move directly to target with speed multiplier only
         for drone_id, drone in self.drones.items():
             self.path_visualizer.update_path_history(drone_id, drone["location"])
 
@@ -2772,12 +2812,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 DroneStatus.FLYING_TO_CUSTOMER,
                 DroneStatus.RETURNING_TO_BASE,
             ]:
-                # RETURNING_TO_BASE：完全按目标直飞，不听 PPO
-                if drone["status"] == DroneStatus.RETURNING_TO_BASE:
-                    alpha = 0.0
-                else:
-                    alpha = float(self.heading_guidance_alpha)
-
                 if "target_location" not in drone:
                     self._reset_drone_to_base(drone_id, drone)
                     continue
@@ -2799,47 +2833,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if speed <= 1e-6:
                     continue
 
-                if headings is None:
-                    ppo_hx, ppo_hy, ppo_u = 0.0, 0.0, 1.0
-                else:
-                    # Extract (hx, hy, u) from action - u is speed multiplier
-                    action_vec = headings[int(drone_id)]
-                    ppo_hx, ppo_hy = action_vec[0], action_vec[1]
-                    ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
+                # U7: Apply PPO speed multiplier (set in _process_action)
+                # No heading control - always move directly toward target
+                ppo_speed_mult = drone.get('ppo_speed_multiplier', 1.0)
 
-                    # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
-                    # Using standard linear interpolation:
-                    #   normalized = (value - old_min) / (old_max - old_min)
-                    #   result = normalized * (new_max - new_min) + new_min
-                    # Here: old_range=[-1,1], new_range=[0.5,1.5]
-                    normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
-                    ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
-                    ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
-
-                ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
-                if ppo_norm > 1e-6:
-                    ppo_hx /= ppo_norm
-                    ppo_hy /= ppo_norm
-                else:
-                    ppo_hx, ppo_hy = 0.0, 0.0
-
+                # Direction vector toward target
                 tgt_hx = to_target_dx / max(dist_to_target, 1e-6)
                 tgt_hy = to_target_dy / max(dist_to_target, 1e-6)
 
-                move_hx = alpha * ppo_hx + (1.0 - alpha) * tgt_hx
-                move_hy = alpha * ppo_hy + (1.0 - alpha) * tgt_hy
-
-                move_norm = math.sqrt(move_hx * move_hx + move_hy * move_hy)
-                if move_norm > 1e-6:
-                    move_hx /= move_norm
-                    move_hy /= move_norm
-                else:
-                    move_hx, move_hy = tgt_hx, tgt_hy
-
                 # Apply speed multiplier from PPO action
-                step_len = min(speed * ppo_u, dist_to_target)
-                nx = float(np.clip(cx + move_hx * step_len, 0, self.grid_size - 1))
-                ny = float(np.clip(cy + move_hy * step_len, 0, self.grid_size - 1))
+                step_len = min(speed * ppo_speed_mult, dist_to_target)
+                nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
+                ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
 
                 if "last_location" in drone:
                     step_distance = float(
@@ -3020,6 +3025,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if order and order['status'] == OrderStatus.ASSIGNED:
                 self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP, reason="batch_pickup")
                 order['pickup_time'] = self.time_system.current_step
+                # U7: Add to cargo to maintain invariant
+                drone['cargo'].add(order_id)
                 picked_count += 1
 
         if picked_count == 0:
@@ -3060,6 +3067,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order_id = drone['batch_orders'][current_index]
             order = self.orders.get(order_id)
             if order and order['status'] == OrderStatus.PICKED_UP:
+                # U7: Remove from cargo before delivery
+                if order_id in drone['cargo']:
+                    drone['cargo'].remove(order_id)
                 self._complete_order_delivery(order_id, drone_id)
 
         current_index += 1
@@ -3178,6 +3188,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP,
                                                                reason="arrived_merchant_pickup")
                         assigned_order['pickup_time'] = self.time_system.current_step
+                        
+                        # U7: Add to cargo to maintain invariant
+                        drone['cargo'].add(oid)
 
                         self._ensure_trip_started(drone)
                         self._accumulate_trip_optimal_leg(drone, drone['location'], assigned_order['customer_location'])
@@ -3200,6 +3213,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if serving_order_id is None:
                     assigned_order = self._get_drone_assigned_order(drone_id)
                     if assigned_order and assigned_order['status'] == OrderStatus.PICKED_UP:
+                        # Remove from cargo on delivery
+                        if assigned_order['id'] in drone['cargo']:
+                            drone['cargo'].remove(assigned_order['id'])
                         self._complete_order_delivery(assigned_order['id'], drone_id)
                 self._safe_reset_drone(drone_id, drone)
 
