@@ -1655,8 +1655,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         shaping_vec = self._calculate_shaping_reward(action)
         r_vec = r_vec + shaping_vec
         self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
-        # U7: Removed _immediate_state_update() to prevent double movement
-        # Only move drones once per step via _process_events()
+        # U7: Disabled drone position updates in _immediate_state_update()
+        # to prevent double movement. Drones now move only once per step
+        # via _update_drone_positions() in _process_events().
+        self._immediate_state_update()
 
         # 动态事件
         self._process_events()
@@ -2620,8 +2622,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     # ------------------ 事件处理与移动 ------------------
 
     def _immediate_state_update(self):
-        # U7: Disabled _update_drone_positions_immediately() to prevent double movement
-        # Drones now only move once per step via _update_drone_positions() in _process_events()
+        # U7: Disabled _update_drone_positions_immediately() to prevent double movement.
+        # Drones now only move once per step via _update_drone_positions() in _process_events().
+        # TODO: This commented code can be removed after thorough testing confirms single movement works correctly.
         # self._update_drone_positions_immediately()
         self._update_merchant_preparation_immediately()
 
