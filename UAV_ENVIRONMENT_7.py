@@ -1853,10 +1853,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         order['assigned_drone'] = -1
 
         if old_drone is not None and old_drone >= 0 and old_drone in self.drones:
-            self.drones[old_drone]['current_load'] = max(0, self.drones[old_drone]['current_load'] - 1)
-            if 'batch_orders' in self.drones[old_drone]:
-                if order_id in self.drones[old_drone]['batch_orders']:
-                    self.drones[old_drone]['batch_orders'].remove(order_id)
+            drone = self.drones[old_drone]
+            drone['current_load'] = max(0, drone['current_load'] - 1)
+            # U7: Remove from cargo when resetting to READY
+            if order_id in drone.get('cargo', set()):
+                drone['cargo'].remove(order_id)
+            if 'batch_orders' in drone:
+                if order_id in drone['batch_orders']:
+                    drone['batch_orders'].remove(order_id)
 
     def _force_complete_order(self, order_id, drone_id):
         """强制完成订单（用于异常状态恢复）（走 StateManager）"""
@@ -1872,8 +1876,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         order['assigned_drone'] = -1
 
         if drone_id in self.drones:
-            self.drones[drone_id]['orders_completed'] += 1
-            self.drones[drone_id]['current_load'] = max(0, self.drones[drone_id]['current_load'] - 1)
+            drone = self.drones[drone_id]
+            drone['orders_completed'] += 1
+            drone['current_load'] = max(0, drone['current_load'] - 1)
+            # U7: Remove from cargo when forcing completion
+            if order_id in drone.get('cargo', set()):
+                drone['cargo'].remove(order_id)
 
         self.metrics['completed_orders'] += 1
         self.daily_stats['orders_completed'] += 1
@@ -1998,6 +2006,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                                                                    reason="sync_assigned_to_picked_up")
                             if 'pickup_time' not in order:
                                 order['pickup_time'] = self.time_system.current_step
+                            # U7: Add to cargo to maintain invariant
+                            drone['cargo'].add(order_id)
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -3012,6 +3022,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if order and order['status'] == OrderStatus.ASSIGNED:
                 self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP, reason="batch_pickup")
                 order['pickup_time'] = self.time_system.current_step
+                # U7: Add to cargo to maintain invariant
+                drone['cargo'].add(order_id)
                 picked_count += 1
 
         if picked_count == 0:
@@ -3052,6 +3064,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             order_id = drone['batch_orders'][current_index]
             order = self.orders.get(order_id)
             if order and order['status'] == OrderStatus.PICKED_UP:
+                # U7: Remove from cargo before delivery
+                if order_id in drone['cargo']:
+                    drone['cargo'].remove(order_id)
                 self._complete_order_delivery(order_id, drone_id)
 
         current_index += 1
@@ -3170,6 +3185,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                         self.state_manager.update_order_status(oid, OrderStatus.PICKED_UP,
                                                                reason="arrived_merchant_pickup")
                         assigned_order['pickup_time'] = self.time_system.current_step
+                        
+                        # U7: Add to cargo to maintain invariant
+                        drone['cargo'].add(oid)
 
                         self._ensure_trip_started(drone)
                         self._accumulate_trip_optimal_leg(drone, drone['location'], assigned_order['customer_location'])
@@ -3192,6 +3210,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if serving_order_id is None:
                     assigned_order = self._get_drone_assigned_order(drone_id)
                     if assigned_order and assigned_order['status'] == OrderStatus.PICKED_UP:
+                        # Remove from cargo on delivery
+                        if assigned_order['id'] in drone['cargo']:
+                            drone['cargo'].remove(assigned_order['id'])
                         self._complete_order_delivery(assigned_order['id'], drone_id)
                 self._safe_reset_drone(drone_id, drone)
 
