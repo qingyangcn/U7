@@ -380,7 +380,8 @@ def train(args):
     except ImportError as e:
         raise RuntimeError("Please install stable-baselines3: pip install stable-baselines3") from e
 
-    os.makedirs(args.log_dir, exist_ok=True)
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.model_dir, exist_ok=True)
 
     def env_fn():
