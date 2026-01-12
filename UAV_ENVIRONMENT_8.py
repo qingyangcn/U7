@@ -18,6 +18,9 @@ plt.rcParams['axes.unicode_minus'] = False
 SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
 SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
 
+# ===== Constants for diagnostics =====
+FORCE_COMPLETE_WARNING_THRESHOLD = 10.0  # Warn if force-complete rate exceeds this % of deliveries
+
 # ===== Constants for state management =====
 ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
@@ -1889,7 +1892,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _force_complete_order(self, order_id, drone_id):
         """
-        强制完成订单（用于异常状态恢复）（走 StateManager）
+        Force-complete order for exceptional state recovery.
         
         This is called by _force_state_synchronization in exceptional cases:
         1. Drone is IDLE/CHARGING with PICKED_UP order (drone completed trip but order not delivered)
@@ -1932,11 +1935,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.completed_orders.add(order_id)
 
     def _force_state_synchronization(self):
-        """强制状态同步：确保订单与无人机状态一致，包括货物不变性"""
+        """Force state synchronization: ensure order and drone states are consistent, including cargo invariants"""
         # Diagnostics: Track sync call
         self.dynamics_diagnostics['force_sync_calls'] += 1
         status_changes = 0
         cargo_changes = 0
+        
+        # Helper to check if we should print debug messages
+        debug_enabled = self.debug_state_warnings or self.debug_env_dynamics
         
         drone_real_orders = {d_id: set() for d_id in self.drones}
 
@@ -1970,7 +1976,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             drone['cargo'] = set()
                         drone['cargo'].add(order_id)
                         cargo_changes += 1
-                        if self.debug_state_warnings or self.debug_env_dynamics:
+                        if debug_enabled:
                             print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} (PICKED_UP) added to drone {drone_id} cargo")
 
         # Check all drones for invariant 2
@@ -1982,7 +1988,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Order doesn't exist - remove from cargo
                     invalid_cargo.append(order_id)
                     cargo_changes += 1
-                    if self.debug_state_warnings or self.debug_env_dynamics:
+                    if debug_enabled:
                         print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} doesn't exist, removed from drone {drone_id} cargo")
                     continue
 
@@ -1991,7 +1997,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Order status is not PICKED_UP - remove from cargo
                     invalid_cargo.append(order_id)
                     cargo_changes += 1
-                    if self.debug_state_warnings or self.debug_env_dynamics:
+                    if debug_enabled:
                         print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} status={order['status']}, removed from drone {drone_id} cargo")
                     continue
 
@@ -1999,7 +2005,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     # Order not assigned to this drone - remove from cargo
                     invalid_cargo.append(order_id)
                     cargo_changes += 1
-                    if self.debug_state_warnings or self.debug_env_dynamics:
+                    if debug_enabled:
                         print(f"[SYNC] Step {self.time_system.current_step}: Order {order_id} not assigned to drone {drone_id}, removed from cargo")
                     continue
 
@@ -4264,7 +4270,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if completed > 0:
                 force_pct = (diag['force_complete_calls'] / completed) * 100
                 print(f"  Force-complete as % of deliveries: {force_pct:.1f}%")
-                if force_pct > 10:
+                if force_pct > FORCE_COMPLETE_WARNING_THRESHOLD:
                     print(f"  WARNING: High force-complete rate suggests environment issues!")
         
         # Delivery statistics

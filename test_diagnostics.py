@@ -44,8 +44,8 @@ def test_diagnostics():
     
     for step in range(num_steps):
         # Random action - check action space first
-        # For U7, action space should be (num_drones, action_dim)
-        # Let's use zeros for simplicity (no action)
+        # For UAV_ENVIRONMENT_8, action space should be (num_drones, action_dim)
+        # Let's use proper action sampling
         action = env.action_space.sample()  # Use proper action sampling
         
         obs, reward, terminated, truncated, info = env.step(action)
