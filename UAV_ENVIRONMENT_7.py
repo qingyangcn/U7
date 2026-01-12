@@ -1644,10 +1644,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         shaping_vec = self._calculate_shaping_reward(action)
         r_vec = r_vec + shaping_vec
         self.episode_r_vec = self.episode_r_vec + r_vec.astype(np.float32)
-        # 动作后立即更新
-        self._immediate_state_update()
 
-        # 动态事件
+        # 动态事件 (includes position update and merchant preparation)
         self._process_events()
 
         # 清理过期分配
@@ -2582,64 +2580,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT, target_merchant_loc)
 
     # ------------------ 事件处理与移动 ------------------
-
-    def _immediate_state_update(self):
-        self._update_drone_positions_immediately()
-        self._update_merchant_preparation_immediately()
-
-    def _update_drone_positions_immediately(self):
-        for drone_id, drone in self.drones.items():
-            if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT,
-                                   DroneStatus.FLYING_TO_CUSTOMER,
-                                   DroneStatus.RETURNING_TO_BASE]:
-
-                if 'target_location' in drone:
-                    current_loc = drone['location']
-                    target_loc = drone['target_location']
-
-                    distance = math.sqrt((target_loc[0] - current_loc[0]) ** 2 +
-                                         (target_loc[1] - current_loc[1]) ** 2)
-
-                    if distance > 0.1:
-                        dx = target_loc[0] - current_loc[0]
-                        dy = target_loc[1] - current_loc[1]
-
-                        # U7: Apply PPO speed multiplier if available
-                        base_move_distance = 0.3
-                        speed_mult = drone.get('ppo_speed_multiplier', 1.0)
-                        move_distance = min(distance, base_move_distance * speed_mult)
-
-                        if distance > 0:
-                            new_x = current_loc[0] + (dx / distance) * move_distance
-                            new_y = current_loc[1] + (dy / distance) * move_distance
-                            drone['location'] = (new_x, new_y)
-
-                            new_distance = math.sqrt((target_loc[0] - new_x) ** 2 +
-                                                     (target_loc[1] - new_y) ** 2)
-                            if new_distance < 0.1:
-                                self._handle_drone_arrival(drone_id, drone)
-
-    def _update_merchant_preparation_immediately(self):
-        for merchant_id, merchant in self.merchants.items():
-            ready_orders = []
-            for order_id in list(merchant['queue']):
-                if order_id not in self.orders:
-                    continue
-
-                order = self.orders[order_id]
-                if order['status'] == OrderStatus.ACCEPTED:
-                    time_elapsed = (self.time_system.current_step - order['creation_time'])
-                    preparation_required = order['preparation_time']
-
-                    if time_elapsed >= preparation_required:
-                        self.state_manager.update_order_status(
-                            order_id, OrderStatus.READY, reason="immediate_preparation"
-                        )
-                        ready_orders.append(order_id)
-
-            for order_id in ready_orders:
-                if order_id in merchant['queue']:
-                    merchant['queue'].remove(order_id)
 
     def _process_events(self):
         self._update_merchant_preparation()
