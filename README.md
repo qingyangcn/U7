@@ -8,24 +8,26 @@ This repository contains the U7 environment for multi-objective drone delivery o
 
 ### Legacy Fallback Control
 
-The environment now includes a `enable_legacy_fallback` flag to control legacy fallback behavior:
+The environment includes a `enable_legacy_fallback` flag to control legacy fallback behavior:
 
-- **Default**: `False` - Legacy fallback is **disabled** by default for clean separation of assignment and task-selection policies
-- **When disabled**: Drones rely on explicit assignment (MOPSO) and task selection (PPO) without implicit fallback logic
-- **When enabled**: Legacy behavior is available for backward compatibility
+- **Default**: `True` - Legacy fallback is **enabled** by default for backward compatibility with existing training scripts
+- **When enabled**: Drones can execute assigned orders using legacy pickup/delivery paths (required for MOPSO+PPO workflows)
+- **When disabled**: Only useful for route-plan mode where `planned_stops` are explicitly set
+
+**Important**: The default is `True` because MOPSO assignment + PPO task selection workflows rely on legacy execution paths. Only disable if using explicit route planning with `planned_stops`.
 
 #### Usage
 
 ```python
-# Create environment with legacy fallback disabled (recommended)
+# Standard MOPSO+PPO workflow (default, recommended)
 env = ThreeObjectiveDroneDeliveryEnv(
-    enable_legacy_fallback=False,  # Clean policy separation
-    debug_state_warnings=True,      # Show when legacy would have triggered
+    enable_legacy_fallback=True,  # Default - required for assignment+task-selection
 )
 
-# Create environment with legacy fallback enabled (backward compatibility)
+# Route-plan mode only (experimental)
 env = ThreeObjectiveDroneDeliveryEnv(
-    enable_legacy_fallback=True,
+    enable_legacy_fallback=False,  # Only for explicit route planning
+    debug_state_warnings=True,      # Show when legacy would have triggered
 )
 ```
 
@@ -42,6 +44,8 @@ With `debug_state_warnings=True`, you'll see detailed logs when legacy paths are
 ```
 [Legacy Blocked] Drone 5 arrival at FLYING_TO_MERCHANT - serving_order_id=None, total_blocked=1
 ```
+
+**Note**: High `legacy_blocked_count` with poor performance indicates you should keep `enable_legacy_fallback=True`.
 
 ### Baseline Heuristics
 

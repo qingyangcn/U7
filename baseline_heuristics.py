@@ -322,12 +322,14 @@ def run_baseline(policy_name: str, num_episodes: int = 10, seed: int = 42) -> No
     else:
         raise ValueError(f"Unknown action type: {action_type}")
     
-    # Create environment with legacy fallback disabled
+    # Create environment
+    # Note: baseline script does its own assignment/action selection, so it can work
+    # with legacy disabled. Standard MOPSO+PPO training should use enable_legacy_fallback=True.
     env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
         num_drones=50,
         max_orders=400,
-        enable_legacy_fallback=False,  # Disable legacy fallback for clean experiments
+        enable_legacy_fallback=True,  # Keep enabled - baselines use assignment+action policies
         debug_state_warnings=False,  # Reduce console spam
         enable_random_events=True,
         reward_output_mode="zero",

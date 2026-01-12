@@ -1094,7 +1094,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  # ===== U7: Task selection parameters =====
                  num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
                  # ===== Legacy fallback control =====
-                 enable_legacy_fallback: bool = False,  # Enable legacy fallback behavior for backward compatibility
+                 enable_legacy_fallback: bool = True,  # Enable legacy fallback behavior (set False only for route-plan mode)
                  ):
         super().__init__()
 

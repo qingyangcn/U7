@@ -13,15 +13,17 @@ Added a new parameter to the environment initialization:
 ```python
 ThreeObjectiveDroneDeliveryEnv(
     ...,
-    enable_legacy_fallback: bool = False,  # NEW: Controls legacy fallback behavior
+    enable_legacy_fallback: bool = True,  # NEW: Controls legacy fallback behavior
 )
 ```
 
-**Default**: `False` - Legacy fallback is disabled by default for clean separation of policies.
+**Default**: `True` - Legacy fallback is **enabled** by default for backward compatibility.
 
 **Purpose**: 
-- When `False`: Drones rely on explicit assignment (MOPSO) and task selection (PPO) without implicit fallback
-- When `True`: Legacy behavior is available for backward compatibility
+- When `True` (default): Drones can execute assigned orders using legacy pickup/delivery paths (required for MOPSO+PPO workflows)
+- When `False`: Only for route-plan mode where `planned_stops` are explicitly set
+
+**Important**: Most training workflows (MOPSO assignment + PPO task selection) require legacy execution paths to be enabled. Only disable for explicit route planning scenarios.
 
 ### 2. Legacy Path Containment
 
@@ -147,7 +149,7 @@ Summary for greedy-cargo:
 ============================================================
 ```
 
-**Note**: `legacy_blocked=0` confirms clean policy separation when `enable_legacy_fallback=False`.
+**Note**: With default `enable_legacy_fallback=True`, legacy paths execute normally. Use `enable_legacy_fallback=False` only for route-plan mode experiments.
 
 ### 5. Documentation
 
@@ -163,7 +165,7 @@ Added comprehensive documentation including:
 
 ## Verification Checklist
 
-- [x] `enable_legacy_fallback` parameter added to `__init__` (default=False)
+- [x] `enable_legacy_fallback` parameter added to `__init__` (default=True for backward compatibility)
 - [x] Instance variable `self.enable_legacy_fallback` set
 - [x] Counter `self.legacy_blocked_count` initialized and reset
 - [x] Legacy arrival handler wrapped with flag check
@@ -183,66 +185,67 @@ Added comprehensive documentation including:
 
 ## Expected Behavior
 
-### With `enable_legacy_fallback=False` (Default)
+### With `enable_legacy_fallback=True` (Default - Recommended)
 
-1. **Clean separation**: Assignment (MOPSO) and task selection (PPO) are separate
-2. **No implicit fallback**: Drones don't automatically select/execute orders via legacy paths
-3. **Trackable**: All legacy attempts are counted and can be monitored
+1. **Backward compatible**: Existing MOPSO+PPO training works as before
+2. **Executes assignments**: Drones can pick up and deliver assigned orders
+3. **Normal operation**: No blocking, legacy paths work normally
+4. **Production ready**: Use this setting for standard training
+
+### With `enable_legacy_fallback=False` (Route-Plan Mode Only)
+
+1. **For route planning**: Only use when explicitly setting `planned_stops`
+2. **Blocks execution**: Legacy pickup/delivery paths are blocked
+3. **Trackable**: All blocked attempts are counted in `legacy_blocked_count`
 4. **Debuggable**: Warnings show when legacy would have triggered
-
-### With `enable_legacy_fallback=True` (Backward Compatibility)
-
-1. **Original behavior**: Legacy paths execute as before
-2. **No counter increment**: Legacy is allowed, so no blocking
-3. **Compatible**: Existing code/experiments continue to work
+5. **Warning**: High `legacy_blocked_count` with poor performance means you should use `True`
 
 ## Testing Recommendations
 
-1. **Run with legacy disabled**:
+1. **Standard MOPSO+PPO Training (recommended)**:
    ```python
-   env = ThreeObjectiveDroneDeliveryEnv(enable_legacy_fallback=False, debug_state_warnings=True)
+   env = ThreeObjectiveDroneDeliveryEnv(enable_legacy_fallback=True)  # Default
    ```
-   - Verify `legacy_blocked_count` in logs
-   - Confirm environment still completes episodes
-   - Check that MOPSO/PPO policies still function
+   - Use this for normal training workflows
+   - MOPSO assigns orders, PPO selects tasks, legacy executes them
+   - Should see high completion rates
 
 2. **Run baseline heuristics**:
    ```bash
    python baseline_heuristics.py --policy all --episodes 5
    ```
    - Verify all policies run without errors
-   - Confirm `legacy_blocked=0` in output
    - Compare completion/on-time rates across policies
 
-3. **Compare with legacy enabled**:
+3. **Route-plan mode experiments (advanced)**:
    ```python
-   env = ThreeObjectiveDroneDeliveryEnv(enable_legacy_fallback=True)
+   env = ThreeObjectiveDroneDeliveryEnv(enable_legacy_fallback=False, debug_state_warnings=True)
    ```
-   - Run same experiments
-   - Compare metrics to understand legacy impact
+   - Only use if explicitly setting `planned_stops` with route plans
+   - Monitor `legacy_blocked_count` - high count indicates misconfiguration
 
 ## Migration Guide
 
 ### For Existing Code
 
-**No changes required** if you want to keep legacy behavior:
+**No changes required** - the default is now `True` for backward compatibility:
 
 ```python
-# Explicitly enable legacy for backward compatibility
+# Works as before - no changes needed
 env = ThreeObjectiveDroneDeliveryEnv(
-    enable_legacy_fallback=True,  # Keep legacy behavior
-    # ... other parameters
+    # ... your existing parameters
+    # enable_legacy_fallback defaults to True
 )
 ```
 
-### For New Experiments
+### For Route-Plan Mode Experiments
 
-**Recommended** to disable legacy for clean policy separation:
+**Only disable legacy** if using explicit route planning:
 
 ```python
-# Use new clean separation (default)
+# Only for route-plan mode with planned_stops
 env = ThreeObjectiveDroneDeliveryEnv(
-    enable_legacy_fallback=False,  # Clean separation (default)
+    enable_legacy_fallback=False,  # Only for route planning
     debug_state_warnings=True,      # See when legacy would trigger
     # ... other parameters
 )
