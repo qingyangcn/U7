@@ -13,8 +13,15 @@ U7 PPO Training (Task Selection + Speed Control) + MOPSO Assignment-Only
       READY orders -> ASSIGNED with assigned_drone set, respecting capacity.
   * No planned_stops route is installed (avoid queueing/append issues).
 
+- Fallback Policy: Handles invalid PPO choices to ensure valid targets each step
+  * --fallback-policy none|cargo_first|first_valid (default: cargo_first)
+  * cargo_first: prioritize orders in cargo, then first valid candidate
+  * first_valid: select first valid candidate
+  * none: no fallback (for testing PPO behavior)
+
 Run:
-  python U7_train_ppo_task_selection.py --total-steps 200000 --seed 42 --num-drones 50 --obs-max-orders 400
+  python U7_train.py --total-steps 200000 --seed 42 --num-drones 50 --obs-max-orders 400
+  python U7_train.py --fallback-policy cargo_first --debug-stats-interval 100
 """
 from __future__ import annotations
 
@@ -84,7 +91,7 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
     """
     Preferred assignment-only path.
 
-    If U7_mopso_dispatcher.py defines apply_mopso_assignment(env, planner), use it.
+    If U7_mopso_dispatcher.py defines apply_mopso_assignment, use it.
     Otherwise:
       - Run planner.mopso_dispatch(env) to get plans, but DO NOT apply planned_stops.
       - Instead, extract commit_orders and call env._process_single_assignment for each.
@@ -95,8 +102,9 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
         from U7_mopso_dispatcher import apply_mopso_assignment  # type: ignore
         # If import succeeds and callable exists, use it.
         if callable(apply_mopso_assignment):
+            # Pass None for assigner - function will create U7MOPSOAssigner internally
             # expected to do READY->ASSIGNED without installing planned_stops
-            res = apply_mopso_assignment(env, planner)
+            res = apply_mopso_assignment(env, assigner=None)
             # allow either int or dict return
             if isinstance(res, int):
                 return res
@@ -125,19 +133,205 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
 
 
 class MOPSOAssignWrapper(gym.Wrapper):
-    """Call assignment-only every step before PPO action is applied."""
+    """
+    Wrapper that:
+    1. Runs MOPSO assignment-only before each step (pre-step operation)
+    2. Applies deterministic fallback policy when PPO chooses invalid candidates
+    3. Tracks and optionally prints debug stats about candidate validity and fallback usage
+    """
 
-    def __init__(self, env: gym.Env, planner: MOPSOPlanner):
+    def __init__(
+        self,
+        env: gym.Env,
+        planner: MOPSOPlanner,
+        fallback_policy: str = "cargo_first",
+        debug_stats_interval: int = 0,
+    ):
         super().__init__(env)
         self.planner = planner
+        self.fallback_policy = fallback_policy
+        self.debug_stats_interval = debug_stats_interval
+        
+        # Stats tracking
+        self.step_count = 0
+        self.stats = {
+            'drones_with_valid_candidates': 0,
+            'total_drones_checked': 0,
+            'ppo_invalid_choices': 0,
+            'fallback_used': 0,
+            'drones_with_cargo': 0,
+            'cargo_first_applied': 0,
+        }
+        
+    def _get_fallback_candidate_idx(self, drone_id: int, candidate_list: list) -> Optional[int]:
+        """
+        Deterministic fallback policy to select a valid candidate when PPO choice is invalid.
+        
+        Args:
+            drone_id: ID of the drone
+            candidate_list: List of (order_id, is_valid) tuples
+            
+        Returns:
+            Index of selected candidate, or None if no valid candidate exists
+        """
+        if self.fallback_policy == "none":
+            return None
+            
+        env = self.env.unwrapped  # type: ignore
+        drone = env.drones.get(drone_id)
+        if drone is None:
+            return None
+            
+        cargo = drone.get('cargo', set())
+        has_cargo = len(cargo) > 0
+        
+        if has_cargo:
+            self.stats['drones_with_cargo'] += 1
+        
+        if self.fallback_policy == "cargo_first":
+            # Priority 1: Orders in cargo (PICKED_UP)
+            for idx, (order_id, is_valid) in enumerate(candidate_list):
+                if is_valid and order_id in cargo:
+                    self.stats['cargo_first_applied'] += 1
+                    return idx
+            
+            # Priority 2: First valid candidate (not in cargo)
+            for idx, (order_id, is_valid) in enumerate(candidate_list):
+                if is_valid:
+                    return idx
+                    
+        elif self.fallback_policy == "first_valid":
+            # Simply return first valid candidate
+            for idx, (order_id, is_valid) in enumerate(candidate_list):
+                if is_valid:
+                    return idx
+                    
+        return None
+        
+    def _apply_fallback_sanitization(
+        self,
+        drone_id: int,
+        candidate_list: list,
+        sanitized_action: np.ndarray,
+        num_candidates: int
+    ) -> None:
+        """
+        Apply fallback candidate selection and sanitize action for a single drone.
+        
+        Updates sanitized_action in-place and increments stats.
+        """
+        self.stats['ppo_invalid_choices'] += 1
+        fallback_idx = self._get_fallback_candidate_idx(drone_id, candidate_list)
+        if fallback_idx is not None:
+            self.stats['fallback_used'] += 1
+            # Sanitize action: replace choice_raw with center-of-bin for fallback choice
+            # Map fallback_idx back to [-1, 1] range (center of bin)
+            new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
+            sanitized_action[drone_id, 0] = new_choice_raw
+    
+    def _apply_fallback_and_sanitize_action(self, action: np.ndarray) -> np.ndarray:
+        """
+        Apply fallback policy for drones with invalid PPO choices and sanitize action.
+        
+        Args:
+            action: Original PPO action (num_drones, 2)
+            
+        Returns:
+            Sanitized action with choice_raw replaced for fallback-chosen candidates
+        """
+        env = self.env.unwrapped  # type: ignore
+        num_drones = env.num_drones
+        num_candidates = env.num_candidates
+        
+        # Make a copy to avoid modifying original
+        sanitized_action = action.copy()
+        
+        for drone_id in range(num_drones):
+            self.stats['total_drones_checked'] += 1
+            
+            # Get candidate mapping
+            if drone_id not in env.drone_candidate_mappings:
+                continue
+                
+            candidate_list = env.drone_candidate_mappings[drone_id]
+            
+            # Check if drone has at least one valid candidate
+            has_valid = any(is_valid for _, is_valid in candidate_list)
+            if has_valid:
+                self.stats['drones_with_valid_candidates'] += 1
+            
+            # Only check at decision points (same logic as env)
+            if not env._is_at_decision_point(drone_id):
+                continue
+                
+            # Decode PPO choice
+            choice_raw = float(action[drone_id, 0])
+            choice_idx = min(
+                int(np.floor((choice_raw + 1.0) / 2.0 * num_candidates)),
+                num_candidates - 1
+            )
+            
+            # Check if PPO choice index is out of bounds
+            if choice_idx >= len(candidate_list):
+                self._apply_fallback_sanitization(drone_id, candidate_list, sanitized_action, num_candidates)
+                continue
+                
+            order_id, is_valid = candidate_list[choice_idx]
+            
+            # Check if PPO choice points to invalid candidate
+            if not is_valid or order_id < 0 or order_id not in env.orders:
+                self._apply_fallback_sanitization(drone_id, candidate_list, sanitized_action, num_candidates)
+                    
+        return sanitized_action
+        
+    def _print_debug_stats(self):
+        """Print debug statistics about candidate validity and fallback usage."""
+        if self.stats['total_drones_checked'] == 0:
+            return
+            
+        valid_frac = self.stats['drones_with_valid_candidates'] / self.stats['total_drones_checked']
+        invalid_frac = self.stats['ppo_invalid_choices'] / self.stats['total_drones_checked']
+        cargo_frac = self.stats['drones_with_cargo'] / self.stats['total_drones_checked']
+            
+        cargo_first_frac = 0.0
+        if self.stats['drones_with_cargo'] > 0:
+            cargo_first_frac = self.stats['cargo_first_applied'] / self.stats['drones_with_cargo']
+        
+        print(f"\n[Step {self.step_count}] Debug Stats:")
+        print(f"  Drones with ≥1 valid candidate: {valid_frac:.2%} ({self.stats['drones_with_valid_candidates']}/{self.stats['total_drones_checked']})")
+        print(f"  PPO invalid choices (fallback used): {invalid_frac:.2%} ({self.stats['ppo_invalid_choices']}/{self.stats['total_drones_checked']})")
+        print(f"  Drones with cargo: {cargo_frac:.2%} ({self.stats['drones_with_cargo']}/{self.stats['total_drones_checked']})")
+        if self.stats['drones_with_cargo'] > 0:
+            print(f"  Cargo-first fallback applied: {cargo_first_frac:.2%} ({self.stats['cargo_first_applied']}/{self.stats['drones_with_cargo']})")
+        
+        # Reset stats for next interval
+        for key in self.stats:
+            self.stats[key] = 0
 
     def step(self, action):
+        # 1. Run MOPSO assignment-only as pre-step operation
         mopso_assignment_only(self.env, self.planner)  # type: ignore[arg-type]
-        return self.env.step(action)
+        
+        # 2. Apply fallback policy and sanitize action
+        sanitized_action = self._apply_fallback_and_sanitize_action(action)
+        
+        # 3. Execute environment step with sanitized action
+        obs, reward, terminated, truncated, info = self.env.step(sanitized_action)
+        
+        # 4. Track and optionally print debug stats
+        self.step_count += 1
+        if self.debug_stats_interval > 0 and self.step_count % self.debug_stats_interval == 0:
+            self._print_debug_stats()
+            
+        return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         mopso_assignment_only(self.env, self.planner)  # type: ignore[arg-type]
+        self.step_count = 0  # Reset step counter
+        # Reset stats
+        for key in self.stats:
+            self.stats[key] = 0
         return obs, info
 
 
@@ -151,6 +345,8 @@ def make_env(
     debug_state_warnings: bool,
     mopso_max_orders: int,
     mopso_max_orders_per_drone: int,
+    fallback_policy: str,
+    debug_stats_interval: int,
 ) -> gym.Env:
     env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
@@ -176,7 +372,7 @@ def make_env(
         eta_stop_service_steps=1,
     )
 
-    env = MOPSOAssignWrapper(env, planner)
+    env = MOPSOAssignWrapper(env, planner, fallback_policy, debug_stats_interval)
     return env
 
 
@@ -188,7 +384,9 @@ def train(args):
     except ImportError as e:
         raise RuntimeError("Please install stable-baselines3: pip install stable-baselines3") from e
 
-    os.makedirs(args.log_dir, exist_ok=True)
+    # Create log directory if specified and not None
+    if args.log_dir is not None:
+        os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.model_dir, exist_ok=True)
 
     def env_fn():
@@ -202,6 +400,8 @@ def train(args):
             debug_state_warnings=args.debug_state_warnings,
             mopso_max_orders=args.mopso_max_orders,
             mopso_max_orders_per_drone=args.mopso_max_orders_per_drone,
+            fallback_policy=args.fallback_policy,
+            debug_stats_interval=args.debug_stats_interval,
         )
 
     env = DummyVecEnv([env_fn])
@@ -213,6 +413,7 @@ def train(args):
     print(f"candidate_k={args.candidate_k}")
     print(f"MOPSO assignment: M={args.mopso_max_orders}, max_orders_per_drone={args.mopso_max_orders_per_drone}")
     print(f"reward_output_mode=scalar, enable_random_events={args.enable_random_events}")
+    print(f"fallback_policy={args.fallback_policy}, debug_stats_interval={args.debug_stats_interval}")
     print("=" * 70)
 
     model = PPO(
@@ -264,6 +465,16 @@ def main():
     # mopso knobs
     p.add_argument("--mopso-max-orders", type=int, default=400)
     p.add_argument("--mopso-max-orders-per-drone", type=int, default=5)
+
+    # fallback policy
+    p.add_argument("--fallback-policy", type=str, default="cargo_first",
+                   choices=["none", "cargo_first", "first_valid"],
+                   help="Fallback policy when PPO chooses invalid candidate: "
+                        "none (no fallback), cargo_first (prioritize cargo orders), "
+                        "first_valid (first valid candidate). Default: cargo_first")
+    p.add_argument("--debug-stats-interval", type=int, default=0,
+                   help="Print debug stats every N steps (0=disabled). Shows candidate validity "
+                        "and fallback usage statistics. Default: 0 (disabled)")
 
     # ppo knobs
     p.add_argument("--lr", type=float, default=3e-4)
