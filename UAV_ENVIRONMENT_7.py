@@ -1093,6 +1093,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  timeout_factor: float = 4.0,  # Multiplier for deadline calculation
                  # ===== U7: Task selection parameters =====
                  num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
+                 # ===== Legacy fallback control =====
+                 enable_legacy_fallback: bool = False,  # Enable legacy fallback behavior for backward compatibility
                  ):
         super().__init__()
 
@@ -1126,6 +1128,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.delivery_sla_steps = int(delivery_sla_steps)  # READY-based delivery SLA
         self.timeout_factor = float(timeout_factor)  # Deadline multiplier
         self.episode_r_vec = np.zeros(self.num_objectives, dtype=np.float32)
+        
+        # ========== Legacy fallback control ==========
+        self.enable_legacy_fallback = bool(enable_legacy_fallback)
+        self.legacy_blocked_count = 0  # Counter for blocked legacy attempts
+        
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
         self.shaping_distance_k = float(shaping_distance_k)
@@ -1610,6 +1617,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # U7: Initialize candidate mappings
         self._update_candidate_mappings()
+        
+        # Reset legacy fallback counter
+        self.legacy_blocked_count = 0
 
         obs = self._get_observation()
         obs['objective_weights'] = self.objective_weights.copy()
@@ -1979,12 +1989,22 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if not drone.get('route_committed', False):
                     # Legacy mode: auto-pickup when flying to customer
                     # Don't auto-pickup in task-selection mode (serving_order_id present)
+                    # Only execute if legacy fallback is enabled
                     if drone.get('serving_order_id') is None:
-                        if order['status'] == OrderStatus.ASSIGNED:
-                            self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
-                                                                   reason="sync_assigned_to_picked_up")
-                            if 'pickup_time' not in order:
-                                order['pickup_time'] = self.time_system.current_step
+                        if self.enable_legacy_fallback:
+                            if order['status'] == OrderStatus.ASSIGNED:
+                                self.state_manager.update_order_status(order_id, OrderStatus.PICKED_UP,
+                                                                       reason="sync_assigned_to_picked_up")
+                                if 'pickup_time' not in order:
+                                    order['pickup_time'] = self.time_system.current_step
+                        else:
+                            # Legacy auto-pickup blocked
+                            if order['status'] == OrderStatus.ASSIGNED:
+                                self.legacy_blocked_count += 1
+                                if self.debug_state_warnings:
+                                    print(f"[Legacy Blocked] Auto-pickup for order {order_id} on drone {drone_id} - "
+                                          f"total_blocked={self.legacy_blocked_count}")
+
 
         for drone_id, drone in self.drones.items():
             if 'batch_orders' in drone:
@@ -3106,6 +3126,22 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             return
 
         # -------- Legacy logic (batch orders) --------
+        # Only execute if legacy fallback is enabled
+        if not self.enable_legacy_fallback:
+            # Legacy fallback is disabled - track blocked attempt
+            self.legacy_blocked_count += 1
+            if self.debug_state_warnings:
+                print(f"[Legacy Blocked] Drone {drone_id} arrival at {drone['status']} - "
+                      f"serving_order_id={serving_order_id}, total_blocked={self.legacy_blocked_count}")
+            # Without legacy fallback, drone should remain in current state or go idle
+            # If drone has no serving_order_id and no planned route, it should be idle
+            if serving_order_id is None and (not drone.get('planned_stops') or len(drone['planned_stops']) == 0):
+                if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.FLYING_TO_CUSTOMER]:
+                    # Reset to idle - PPO/dispatcher will decide next action
+                    self._safe_reset_drone(drone_id, drone)
+            return
+        
+        # Legacy fallback enabled - execute original legacy logic
         if drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
             if 'batch_orders' in drone and drone['batch_orders']:
                 self._handle_batch_pickup(drone_id, drone)
@@ -3638,6 +3674,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         print(f"  完成订单: {self.daily_stats['orders_completed']}")
         print(f"  取消订单: {self.daily_stats['orders_cancelled']}")
         print(f"  准时交付: {self.daily_stats['on_time_deliveries']}")
+        
+        # Report legacy blocked count if any
+        if self.legacy_blocked_count > 0:
+            print(f"  Legacy fallback blocked: {self.legacy_blocked_count} times")
+        elif not self.enable_legacy_fallback:
+            print(f"  Legacy fallback: DISABLED (0 attempts blocked)")
 
         unfinished_orders = list(self.active_orders)
         for order_id in unfinished_orders:
@@ -3835,7 +3877,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 'avg_distance': np.mean([o['distance'] for o in self.order_history]) if self.order_history else 0
             },
             'time_state': self.time_system.get_time_state(),
-            'backlog_size': len(self.active_orders)
+            'backlog_size': len(self.active_orders),
+            'legacy_blocked_count': self.legacy_blocked_count,
+            'legacy_fallback_enabled': self.enable_legacy_fallback
         }
 
         if self.daily_stats['orders_completed'] > 0:
