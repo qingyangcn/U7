@@ -2317,6 +2317,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     self.state_manager.update_drone_status(
                         drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
                     )
+            elif order['status'] == OrderStatus.READY:
+                # Order is READY (not yet assigned) -> assign it first, then go to merchant
+                # This handles the case where PPO selects a READY order from candidates
+                self._process_single_assignment(drone_id, order_id, allow_busy=True)
+                # After assignment, order status is now ASSIGNED
+                # Set target to merchant
+                merchant_id = order.get('merchant_id')
+                if merchant_id and merchant_id in self.merchants:
+                    merchant_loc = self.merchants[merchant_id]['location']
+                    drone['target_location'] = merchant_loc
+                    drone['current_merchant_id'] = merchant_id
+                    self.state_manager.update_drone_status(
+                        drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
+                    )
 
         # Calculate rewards based on system metrics
         r_vec = self._calculate_three_objective_rewards()
