@@ -343,10 +343,13 @@ def make_env(
     candidate_k: int,
     enable_random_events: bool,
     debug_state_warnings: bool,
+    debug_task_selection: bool,
+    debug_task_selection_interval: int,
     mopso_max_orders: int,
     mopso_max_orders_per_drone: int,
     fallback_policy: str,
     debug_stats_interval: int,
+    enable_legacy_fallback: bool,
 ) -> gym.Env:
     env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
@@ -359,8 +362,11 @@ def make_env(
         reward_output_mode="scalar",        # IMPORTANT: PPO必须是scalar才会学
         enable_random_events=enable_random_events,
         debug_state_warnings=debug_state_warnings,
+        debug_task_selection=debug_task_selection,
+        debug_task_selection_interval=debug_task_selection_interval,
         fixed_objective_weights=(0.5, 0.3, 0.2),
         num_candidates=candidate_k,         # K=20
+        enable_legacy_fallback=enable_legacy_fallback,
     )
 
     planner = MOPSOPlanner(
@@ -398,10 +404,13 @@ def train(args):
             candidate_k=args.candidate_k,
             enable_random_events=args.enable_random_events,
             debug_state_warnings=args.debug_state_warnings,
+            debug_task_selection=args.debug_task_selection,
+            debug_task_selection_interval=args.debug_task_selection_interval,
             mopso_max_orders=args.mopso_max_orders,
             mopso_max_orders_per_drone=args.mopso_max_orders_per_drone,
             fallback_policy=args.fallback_policy,
             debug_stats_interval=args.debug_stats_interval,
+            enable_legacy_fallback=args.enable_legacy_fallback,
         )
 
     env = DummyVecEnv([env_fn])
@@ -414,6 +423,8 @@ def train(args):
     print(f"MOPSO assignment: M={args.mopso_max_orders}, max_orders_per_drone={args.mopso_max_orders_per_drone}")
     print(f"reward_output_mode=scalar, enable_random_events={args.enable_random_events}")
     print(f"fallback_policy={args.fallback_policy}, debug_stats_interval={args.debug_stats_interval}")
+    print(f"enable_legacy_fallback={args.enable_legacy_fallback}")
+    print(f"debug_task_selection={args.debug_task_selection}, interval={args.debug_task_selection_interval}")
     print("=" * 70)
 
     model = PPO(
@@ -461,6 +472,17 @@ def main():
 
     p.add_argument("--enable-random-events", action="store_true")
     p.add_argument("--debug-state-warnings", action="store_true")
+    
+    # debug instrumentation
+    p.add_argument("--debug-task-selection", action="store_true",
+                   help="Enable detailed task selection debugging in environment. "
+                        "Shows PPO action application, candidate validity, and legacy blocking reasons.")
+    p.add_argument("--debug-task-selection-interval", type=int, default=100,
+                   help="Print environment debug stats every N steps when --debug-task-selection is enabled. "
+                        "Default: 100")
+    p.add_argument("--enable-legacy-fallback", action="store_true", default=False,
+                   help="Enable legacy fallback behavior for backward compatibility. "
+                        "When disabled (default), only PPO/MOPSO control drone targets.")
 
     # mopso knobs
     p.add_argument("--mopso-max-orders", type=int, default=400)
