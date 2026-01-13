@@ -1400,12 +1400,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # U7: PPO outputs task choice (continuous [-1, 1] mapped to discrete [0, K-1]) + speed multiplier
-        # Action shape: (num_drones, 2) where:
-        #   [:, 0] is choice in [-1, 1] (continuous) -> internally discretized to [0, K-1]
-        #   [:, 1] is speed in [-1, 1] (continuous) -> mapped to [0.5, 1.5]
+        # U8: PPO outputs task choice only (continuous [-1, 1] mapped to discrete [0, K-1])
+        # Action shape: (num_drones,) where each element is choice in [-1, 1]
+        # Speed is controlled by a fixed multiplier, not by PPO action
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
+            low=-1.0, high=1.0, shape=(self.num_drones,), dtype=np.float32,
         )
 
     # ------------------ 时间单位统一：minutes <-> steps ------------------
@@ -2165,31 +2164,29 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _process_action(self, action):
         """
-        U7: Process action containing task choice + speed control.
-        Action shape: (num_drones, 2) where:
-          action[d, 0]: task choice in [-1, 1] -> discretized to [0, K-1]
-          action[d, 1]: speed multiplier in [-1, 1] -> mapped to [0.5, 1.5]
+        U8: Process action containing task choice only (speed is fixed).
+        Action shape: (num_drones,) where:
+          action[d]: task choice in [-1, 1] -> discretized to [0, K-1]
+        Speed is controlled by a fixed multiplier (default 1.0).
         """
         self._last_route_heading = action
 
         # Reset action applied counter for diagnostics
         self.action_applied_count = 0
 
+        # Fixed speed multiplier (no longer controlled by PPO)
+        # Users can adjust this value for different speed behaviors
+        FIXED_SPEED_MULTIPLIER = 1.0
+
         # Process each drone's action
         for drone_id in range(self.num_drones):
             drone = self.drones[drone_id]
 
-            # Extract action components
-            choice_raw = float(action[drone_id, 0])
-            speed_raw = float(action[drone_id, 1])
+            # Extract action component (task choice only)
+            choice_raw = float(action[drone_id])
 
-            # Map speed: [-1, 1] -> [0.5, 1.5]
-            speed_multiplier = (speed_raw + 1.0) / 2.0 * (
-                    SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
-            speed_multiplier = np.clip(speed_multiplier, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
-
-            # Store speed multiplier (used in movement)
-            drone['ppo_speed_multiplier'] = float(speed_multiplier)
+            # Store fixed speed multiplier (used in movement)
+            drone['ppo_speed_multiplier'] = FIXED_SPEED_MULTIPLIER
 
             # Only process task choice at decision points
             if not self._is_at_decision_point(drone_id):

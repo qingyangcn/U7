@@ -1,10 +1,10 @@
 """
-U7 PPO Training (Task Selection + Speed Control) + MOPSO Assignment-Only
+U8 PPO Training (Task Selection Only) + MOPSO Assignment-Only
 
-- Env: UAV_ENVIRONMENT_7.ThreeObjectiveDroneDeliveryEnv
-  * Action: Box(shape=(num_drones,2)) where:
-      action[d,0] = choice_raw in [-1,1] (env discretizes to candidate index)
-      action[d,1] = speed_raw  in [-1,1] (env maps to speed multiplier)
+- Env: UAV_ENVIRONMENT_8.ThreeObjectiveDroneDeliveryEnv
+  * Action: Box(shape=(num_drones,)) where:
+      action[d] = choice_raw in [-1,1] (env discretizes to candidate index)
+  * Speed is controlled by a fixed multiplier (default 1.0), not by PPO
   * Observation: Dict includes candidates (num_drones, K=20, 12)
   * reward_output_mode: "scalar" (required for SB3 PPO learning)
 
@@ -20,8 +20,8 @@ U7 PPO Training (Task Selection + Speed Control) + MOPSO Assignment-Only
   * none: no fallback (for testing PPO behavior)
 
 Run:
-  python U7_train.py --total-steps 200000 --seed 42 --num-drones 50 --obs-max-orders 400
-  python U7_train.py --fallback-policy cargo_first --debug-stats-interval 100
+  python U8_train.py --total-steps 200000 --seed 42 --num-drones 50 --obs-max-orders 400
+  python U8_train.py --fallback-policy cargo_first --debug-stats-interval 100
 """
 from __future__ import annotations
 
@@ -266,7 +266,7 @@ class MOPSOAssignWrapper(gym.Wrapper):
             # Sanitize action: replace choice_raw with center-of-bin for fallback choice
             # Map fallback_idx back to [-1, 1] range (center of bin)
             new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
-            sanitized_action[drone_id, 0] = new_choice_raw
+            sanitized_action[drone_id] = new_choice_raw
         else:
             # No valid candidate found - PPO chose invalid and no fallback available
             self.stats['no_valid_candidate_count'] += 1
@@ -276,7 +276,7 @@ class MOPSOAssignWrapper(gym.Wrapper):
         Apply fallback policy for drones with invalid PPO choices and sanitize action.
 
         Args:
-            action: Original PPO action (num_drones, 2)
+            action: Original PPO action (num_drones,) - task choice only
 
         Returns:
             Sanitized action with choice_raw replaced for fallback-chosen candidates
@@ -307,7 +307,7 @@ class MOPSOAssignWrapper(gym.Wrapper):
                 continue
 
             # Decode PPO choice
-            choice_raw = float(action[drone_id, 0])
+            choice_raw = float(action[drone_id])
             choice_idx = min(
                 int(np.floor((choice_raw + 1.0) / 2.0 * num_candidates)),
                 num_candidates - 1
@@ -469,7 +469,8 @@ def train(args):
     env = DummyVecEnv([env_fn])
 
     print("=" * 70)
-    print("U7 PPO: per-drone task selection (K=20) + speed control; MOPSO assignment-only each step")
+    print("U8 PPO: per-drone task selection (K=20); MOPSO assignment-only each step")
+    print("Speed controlled by fixed multiplier (no PPO speed control)")
     print("=" * 70)
     print(f"num_drones={args.num_drones}, obs_max_orders={args.obs_max_orders}, top_k_merchants={args.top_k_merchants}")
     print(f"candidate_k={args.candidate_k}")
