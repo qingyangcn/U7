@@ -14,16 +14,12 @@ from sklearn.cluster import KMeans
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ===== Constants for action processing =====
-SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
-SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
-
 # ===== Constants for state management =====
 ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
 
-
-# Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
+# ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
+FIXED_SPEED_MULTIPLIER = 1.0  # Fixed speed multiplier for all drones
 
 
 def set_global_seed(seed):
@@ -2173,10 +2169,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # Reset action applied counter for diagnostics
         self.action_applied_count = 0
-
-        # Fixed speed multiplier (no longer controlled by PPO)
-        # Users can adjust this value for different speed behaviors
-        FIXED_SPEED_MULTIPLIER = 1.0
 
         # Process each drone's action
         for drone_id in range(self.num_drones):
