@@ -2268,9 +2268,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Store speed multiplier (used in movement)
             drone['ppo_speed_multiplier'] = float(speed_multiplier)
 
-            # Only process task choice at decision points
-            if not self._is_at_decision_point(drone_id):
-                continue
+            # Process task choice - allow PPO to change target at any step
+            # (User request: remove decision point restriction for more flexible control)
 
             # Map choice: [-1, 1] -> [0, K-1]
             # Using min to handle edge case where choice_raw = 1.0 would give K

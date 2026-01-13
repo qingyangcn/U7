@@ -260,9 +260,8 @@ class MOPSOAssignWrapper(gym.Wrapper):
             if has_valid:
                 self.stats['drones_with_valid_candidates'] += 1
 
-            # Only check at decision points (same logic as env)
-            if not env._is_at_decision_point(drone_id):
-                continue
+            # Process PPO choice - allow changes at any step
+            # (User request: remove decision point restriction)
 
             # Decode PPO choice
             choice_raw = float(action[drone_id, 0])
