@@ -2119,7 +2119,12 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _is_at_decision_point(self, drone_id: int) -> bool:
         """
         Check if drone is at a decision point where PPO can change target.
-        Decision points: IDLE, just arrived at merchant (after pickup), just arrived at customer (after delivery).
+        
+        KEY FIX: Allow action whenever drone needs a serving_order, not just at restrictive conditions.
+        Decision points:
+        1. IDLE - drone has no work
+        2. No serving_order_id - drone needs to select work
+        3. Just arrived at target (close to merchant/customer) - can select next work
         """
         drone = self.drones[drone_id]
         status = drone['status']
@@ -2127,23 +2132,34 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Always a decision point when IDLE
         if status == DroneStatus.IDLE:
             return True
+        
+        # KEY FIX: Allow action whenever drone doesn't have a valid serving_order_id
+        # This ensures drones can get work assigned even while flying
+        serving_order_id = drone.get('serving_order_id')
+        if serving_order_id is None:
+            return True
+        
+        # Check if serving_order is still valid
+        if serving_order_id not in self.orders:
+            return True
+        
+        order = self.orders[serving_order_id]
+        # If serving_order is cancelled or delivered, need new work
+        if order['status'] in [OrderStatus.CANCELLED, OrderStatus.DELIVERED]:
+            return True
 
-        # Decision point if we just completed a pickup or delivery
-        # This is checked when drone status transitions happen, but for simplicity,
-        # we'll check if drone has arrived at target (distance < threshold)
-        if 'target_location' not in drone:
-            return False
-
-        dist_to_target = self._get_dist_to_target(drone_id)
-
-        # If very close to target and in appropriate status
-        if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
-            if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
-                # At merchant - decision point after pickup
-                return True
-            elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
-                # At customer - decision point after delivery
-                return True
+        # Decision point if we just completed a pickup or delivery (arrived at target)
+        if 'target_location' in drone:
+            dist_to_target = self._get_dist_to_target(drone_id)
+            
+            # If very close to target and in appropriate status
+            if dist_to_target < DISTANCE_CLOSE_THRESHOLD:
+                if status in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.WAITING_FOR_PICKUP]:
+                    # At merchant - decision point after pickup
+                    return True
+                elif status in [DroneStatus.FLYING_TO_CUSTOMER, DroneStatus.DELIVERING]:
+                    # At customer - decision point after delivery
+                    return True
 
         return False
 
@@ -2602,6 +2618,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if not actually_assigned:
             return
 
+        # KEY FIX: Set serving_order_id to first order in batch
+        drone['serving_order_id'] = actually_assigned[0]
+        
         first_order = self.orders[actually_assigned[0]]
         self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT,
                                                first_order['merchant_location'])
@@ -2643,6 +2662,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         target_merchant_loc = order['merchant_location']
 
         if drone['status'] in [DroneStatus.IDLE, DroneStatus.RETURNING_TO_BASE, DroneStatus.CHARGING]:
+            # KEY FIX: Set serving_order_id when assigning to IDLE/RETURNING/CHARGING drone
+            drone['serving_order_id'] = order_id
+            
             self._ensure_trip_started(drone)
             self._accumulate_trip_optimal_leg(drone, drone['location'], target_merchant_loc)
 
@@ -2650,9 +2672,14 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             self.state_manager.update_drone_status(drone_id, DroneStatus.FLYING_TO_MERCHANT, target_merchant_loc)
 
         elif drone['status'] == DroneStatus.FLYING_TO_MERCHANT:
+            # Already flying to merchant, just add to load (batch order scenario)
+            # Keep existing serving_order_id
             pass
 
         elif drone['status'] == DroneStatus.FLYING_TO_CUSTOMER:
+            # Redirect to new merchant for additional pickup
+            # Keep serving_order_id as the order in cargo (being delivered)
+            # This new assignment is for after delivery
             self._ensure_trip_started(drone)
             self._accumulate_trip_optimal_leg(drone, drone['location'], target_merchant_loc)
 
