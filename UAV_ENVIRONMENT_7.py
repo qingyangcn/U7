@@ -1480,9 +1480,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         Returns list of (order_id, is_valid) tuples of length num_candidates (K=20).
 
         Priority:
-        1. Orders in drone cargo (PICKED_UP) assigned to this drone
-        2. Orders ASSIGNED to this drone but not yet picked up
-        3. Padding with (-1, False) for invalid slots
+        1. Orders in drone cargo (PICKED_UP) assigned to this drone - for delivery
+        2. Orders ASSIGNED to this drone but not yet picked up - for pickup
+        3. READY orders available for assignment - for new work selection
+        4. Padding with (-1, False) for invalid slots
 
         Returns:
             List of (order_id, is_valid) tuples, always length K
@@ -1490,7 +1491,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         drone = self.drones[drone_id]
         candidates = []
 
-        # 1. Orders already in cargo (PICKED_UP)
+        # 1. Orders already in cargo (PICKED_UP) - highest priority for delivery
         cargo_orders = list(drone.get('cargo', set()))
         for oid in cargo_orders:
             if oid in self.orders:
@@ -1498,7 +1499,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order['status'] == OrderStatus.PICKED_UP:
                     candidates.append((oid, True))
 
-        # 2. Orders assigned but not picked up
+        # 2. Orders assigned but not picked up - for pickup
         for oid in self.active_orders:
             if len(candidates) >= self.num_candidates:
                 break
@@ -1507,7 +1508,23 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if order['status'] == OrderStatus.ASSIGNED and oid not in cargo_orders:
                     candidates.append((oid, True))
 
-        # 3. Pad with invalid entries
+        # 3. READY orders available for assignment - new work
+        # Only include if drone has capacity
+        if drone['current_load'] < drone['max_capacity'] and len(candidates) < self.num_candidates:
+            ready_orders = []
+            for oid in self.active_orders:
+                if oid in self.orders:
+                    order = self.orders[oid]
+                    if order['status'] == OrderStatus.READY and order.get('assigned_drone', -1) == -1:
+                        ready_orders.append(oid)
+            
+            # Add READY orders up to capacity
+            for oid in ready_orders:
+                if len(candidates) >= self.num_candidates:
+                    break
+                candidates.append((oid, True))
+
+        # 4. Pad with invalid entries
         while len(candidates) < self.num_candidates:
             candidates.append((-1, False))
 
@@ -2094,7 +2111,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
     def _is_at_decision_point(self, drone_id: int) -> bool:
         """
         Check if drone is at a decision point where PPO can change target.
-        Decision points: IDLE, just arrived at merchant (after pickup), just arrived at customer (after delivery).
+        
+        With legacy fallback disabled, we need PPO to be able to act frequently
+        to select next orders. Decision points include:
+        - IDLE: drone has no current task
+        - No serving_order_id: drone needs work assignment
+        - Just arrived at merchant (close to target while FLYING_TO_MERCHANT/WAITING_FOR_PICKUP)
+        - Just arrived at customer (close to target while FLYING_TO_CUSTOMER/DELIVERING)
         """
         drone = self.drones[drone_id]
         status = drone['status']
@@ -2102,12 +2125,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Always a decision point when IDLE
         if status == DroneStatus.IDLE:
             return True
+        
+        # Decision point if drone has no serving order - needs new work
+        # This is critical when legacy fallback is disabled
+        if drone.get('serving_order_id') is None:
+            return True
 
         # Decision point if we just completed a pickup or delivery
         # This is checked when drone status transitions happen, but for simplicity,
         # we'll check if drone has arrived at target (distance < threshold)
         if 'target_location' not in drone:
-            return False
+            # No target but has serving_order - inconsistent state, allow PPO to fix
+            return True
 
         dist_to_target = self._get_dist_to_target(drone_id)
 
@@ -2248,6 +2277,13 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     self.state_manager.update_drone_status(
                         drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
                     )
+            elif order['status'] == OrderStatus.READY:
+                # PPO selected a READY order - assign it to this drone
+                if drone['current_load'] < drone['max_capacity']:
+                    # Use _process_single_assignment to handle assignment logic
+                    self._process_single_assignment(drone_id, order_id, allow_busy=True)
+                    # After assignment, the order is now ASSIGNED and drone should go to merchant
+                    # The assignment call above should have set the target and status
 
         # Calculate rewards based on system metrics
         r_vec = self._calculate_three_objective_rewards()
@@ -3221,7 +3257,28 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             if self.debug_state_warnings:
                 print(f"[Legacy Blocked] Drone {drone_id} arrival at {drone['status']} - "
                       f"serving_order_id={serving_order_id}, total_blocked={self.legacy_blocked_count}")
-            # Without legacy fallback, drone should remain in current state or go idle
+            
+            # Handle RETURNING_TO_BASE arrival even when legacy is disabled
+            # Drones need to transition to IDLE when they arrive at base
+            if drone['status'] == DroneStatus.RETURNING_TO_BASE:
+                if drone['battery_level'] < 80:
+                    self.state_manager.update_drone_status(drone_id, DroneStatus.CHARGING, target_location=None)
+                else:
+                    self.state_manager.update_drone_status(drone_id, DroneStatus.IDLE, target_location=None)
+                
+                drone['current_load'] = 0
+                self._clear_drone_batch_state(drone)
+                self._clear_task_data(drone_id, drone)
+                
+                # Clear route-plan and task-selection state
+                drone['planned_stops'] = deque()
+                drone['cargo'] = set()
+                drone['current_stop'] = None
+                drone['route_committed'] = False
+                drone['serving_order_id'] = None
+                return
+            
+            # For other statuses without legacy fallback, reset to idle if drone has no work
             # If drone has no serving_order_id and no planned route, it should be idle
             if serving_order_id is None and (not drone.get('planned_stops') or len(drone['planned_stops']) == 0):
                 if drone['status'] in [DroneStatus.FLYING_TO_MERCHANT, DroneStatus.FLYING_TO_CUSTOMER]:
