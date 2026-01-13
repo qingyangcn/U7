@@ -1132,6 +1132,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # ========== Legacy fallback control ==========
         self.enable_legacy_fallback = bool(enable_legacy_fallback)
         self.legacy_blocked_count = 0  # Counter for blocked legacy attempts
+        
+        # ========== Debug instrumentation for task selection ==========
+        self.debug_task_selection = {}  # Per-step debug stats
+        self._init_debug_stats()
 
         # ========== shaping 参数 ==========
         self.shaping_progress_k = float(shaping_progress_k)
@@ -1255,6 +1259,97 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         self.current_obs_order_ids = []
 
     # ------------------ 初始化相关 ------------------
+
+    def _init_debug_stats(self):
+        """Initialize debug statistics for task selection monitoring."""
+        self.debug_task_selection = {
+            'drones_with_serving_order': 0,
+            'drones_with_valid_candidates': 0,
+            'drones_with_cargo_candidates': 0,
+            'drones_with_assigned_candidates': 0,
+            'drones_with_ready_candidates': 0,
+            'legacy_blocked_reasons': {},
+        }
+
+    def _reset_debug_stats(self):
+        """Reset debug statistics for next step."""
+        self.debug_task_selection = {
+            'drones_with_serving_order': 0,
+            'drones_with_valid_candidates': 0,
+            'drones_with_cargo_candidates': 0,
+            'drones_with_assigned_candidates': 0,
+            'drones_with_ready_candidates': 0,
+            'legacy_blocked_reasons': {},
+        }
+
+    def _collect_debug_stats(self):
+        """Collect debug statistics for current step."""
+        if not self.debug_state_warnings:
+            return
+        
+        for drone_id in range(self.num_drones):
+            drone = self.drones[drone_id]
+            
+            # Count drones with serving_order_id
+            if drone.get('serving_order_id') is not None:
+                self.debug_task_selection['drones_with_serving_order'] += 1
+            
+            # Get candidate mapping
+            if drone_id not in self.drone_candidate_mappings:
+                continue
+            
+            candidate_list = self.drone_candidate_mappings[drone_id]
+            has_valid = False
+            has_cargo = False
+            has_assigned = False
+            has_ready = False
+            
+            for order_id, is_valid in candidate_list:
+                if not is_valid or order_id < 0 or order_id not in self.orders:
+                    continue
+                
+                has_valid = True
+                order = self.orders[order_id]
+                
+                if order['status'] == OrderStatus.PICKED_UP:
+                    has_cargo = True
+                elif order['status'] == OrderStatus.ASSIGNED:
+                    has_assigned = True
+                elif order['status'] == OrderStatus.READY:
+                    has_ready = True
+            
+            if has_valid:
+                self.debug_task_selection['drones_with_valid_candidates'] += 1
+            if has_cargo:
+                self.debug_task_selection['drones_with_cargo_candidates'] += 1
+            if has_assigned:
+                self.debug_task_selection['drones_with_assigned_candidates'] += 1
+            if has_ready:
+                self.debug_task_selection['drones_with_ready_candidates'] += 1
+
+    def _record_legacy_blocked_reason(self, reason: str, drone_id: int):
+        """Record reason for legacy fallback being blocked."""
+        if reason not in self.debug_task_selection['legacy_blocked_reasons']:
+            self.debug_task_selection['legacy_blocked_reasons'][reason] = []
+        self.debug_task_selection['legacy_blocked_reasons'][reason].append(drone_id)
+
+    def _print_debug_stats(self, step: int):
+        """Print debug statistics if warnings enabled."""
+        if not self.debug_state_warnings or step % 100 != 0:
+            return
+        
+        stats = self.debug_task_selection
+        print(f"\n[Env Step {step}] Task Selection Debug Stats:")
+        print(f"  Drones with serving_order_id: {stats['drones_with_serving_order']}/{self.num_drones}")
+        print(f"  Drones with valid candidates: {stats['drones_with_valid_candidates']}/{self.num_drones}")
+        print(f"  - with cargo candidates: {stats['drones_with_cargo_candidates']}")
+        print(f"  - with assigned candidates: {stats['drones_with_assigned_candidates']}")
+        print(f"  - with ready candidates: {stats['drones_with_ready_candidates']}")
+        
+        if stats['legacy_blocked_reasons']:
+            print(f"  Legacy blocked reasons this interval:")
+            for reason, drone_ids in stats['legacy_blocked_reasons'].items():
+                print(f"    {reason}: {len(drone_ids)} times")
 
     def _init_locations_fixed_bases(self, base_method: str = "kmeans"):
         """固定 num_bases：只生成 num_bases 个 base 坐标；不再在这里修改 self.num_bases"""
@@ -1464,32 +1559,71 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         Priority:
         1. Orders in drone cargo (PICKED_UP) assigned to this drone
         2. Orders ASSIGNED to this drone but not yet picked up
-        3. Padding with (-1, False) for invalid slots
+        3. Nearby READY orders (unassigned, available for selection)
+        4. Padding with (-1, False) for invalid slots
 
         Returns:
             List of (order_id, is_valid) tuples, always length K
         """
         drone = self.drones[drone_id]
         candidates = []
+        seen_orders = set()
 
-        # 1. Orders already in cargo (PICKED_UP)
+        # 1. Orders already in cargo (PICKED_UP) - highest priority for completion
         cargo_orders = list(drone.get('cargo', set()))
         for oid in cargo_orders:
             if oid in self.orders:
                 order = self.orders[oid]
-                if order['status'] == OrderStatus.PICKED_UP:
+                if order['status'] == OrderStatus.PICKED_UP and order.get('assigned_drone') == drone_id:
                     candidates.append((oid, True))
+                    seen_orders.add(oid)
 
-        # 2. Orders assigned but not picked up
+        # 2. Orders assigned but not picked up - committed work
         for oid in self.active_orders:
             if len(candidates) >= self.num_candidates:
                 break
+            if oid in seen_orders:
+                continue
             order = self.orders.get(oid)
             if order and order.get('assigned_drone') == drone_id:
-                if order['status'] == OrderStatus.ASSIGNED and oid not in cargo_orders:
+                if order['status'] == OrderStatus.ASSIGNED:
                     candidates.append((oid, True))
+                    seen_orders.add(oid)
 
-        # 3. Pad with invalid entries
+        # 3. READY orders - available for new assignments
+        # Include READY orders that are unassigned and could be picked by this drone
+        # This ensures drones always have work options even after completing current tasks
+        if len(candidates) < self.num_candidates:
+            ready_orders = []
+            drone_loc = drone['location']
+            
+            for oid in self.active_orders:
+                if oid in seen_orders:
+                    continue
+                order = self.orders.get(oid)
+                if not order:
+                    continue
+                    
+                # Only include READY orders that are unassigned
+                if order['status'] == OrderStatus.READY:
+                    assigned_drone = order.get('assigned_drone', -1)
+                    if assigned_drone in (-1, None):
+                        # Calculate distance to merchant for prioritization
+                        merchant_id = order.get('merchant_id')
+                        if merchant_id and merchant_id in self.merchants:
+                            merchant_loc = self.merchants[merchant_id]['location']
+                            dist = self._calculate_euclidean_distance(drone_loc, merchant_loc)
+                            ready_orders.append((oid, dist))
+            
+            # Sort by distance (nearest first) and add to candidates
+            ready_orders.sort(key=lambda x: x[1])
+            for oid, _ in ready_orders:
+                if len(candidates) >= self.num_candidates:
+                    break
+                candidates.append((oid, True))
+                seen_orders.add(oid)
+
+        # 4. Pad with invalid entries
         while len(candidates) < self.num_candidates:
             candidates.append((-1, False))
 
@@ -1646,6 +1780,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
         # U7: Update candidate mappings before processing action
         self._update_candidate_mappings()
+        
+        # Collect debug stats if enabled
+        self._reset_debug_stats()
+        self._collect_debug_stats()
 
         # 处理动作（heading 不直接给奖励，奖励来自系统指标+shaping）
         r_vec = self._process_action(action)
@@ -1675,6 +1813,9 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     f"[WARNING] on_time_deliveries decreased from {self._prev_on_time_deliveries} to {current_on_time} at step {self.time_system.current_step}")
                 self._on_time_decrease_warned = True
             self._prev_on_time_deliveries = current_on_time
+            
+            # Print debug stats periodically
+            self._print_debug_stats(self.time_system.current_step)
 
         # 生成新订单（高负载）
         self._generate_new_orders()
@@ -2001,6 +2142,7 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                             # Legacy auto-pickup blocked
                             if order['status'] == OrderStatus.ASSIGNED:
                                 self.legacy_blocked_count += 1
+                                self._record_legacy_blocked_reason("auto_pickup_blocked", drone_id)
                                 if self.debug_state_warnings:
                                     print(f"[Legacy Blocked] Auto-pickup for order {order_id} on drone {drone_id} - "
                                           f"total_blocked={self.legacy_blocked_count}")
@@ -2126,8 +2268,35 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Store speed multiplier (used in movement)
             drone['ppo_speed_multiplier'] = float(speed_multiplier)
 
-            # Only process task choice at decision points
-            if not self._is_at_decision_point(drone_id):
+            # Process task choice with smart commitment logic
+            # Allow PPO to change targets, but prevent task thrashing by:
+            # - Completing pickups before switching (if FLYING_TO_MERCHANT with ASSIGNED order)
+            # - Completing deliveries before switching (if FLYING_TO_CUSTOMER with PICKED_UP cargo)
+            # - Allowing switches when IDLE or when current task is invalid
+            
+            # Check if drone should be committed to current task
+            should_commit_to_current_task = False
+            current_serving = drone.get('serving_order_id')
+            
+            if current_serving is not None and current_serving in self.orders:
+                current_order = self.orders[current_serving]
+                drone_status = drone['status']
+                
+                # Commit if flying to merchant with valid ASSIGNED order
+                if (drone_status == DroneStatus.FLYING_TO_MERCHANT and 
+                    current_order['status'] == OrderStatus.ASSIGNED and
+                    current_order.get('assigned_drone') == drone_id):
+                    should_commit_to_current_task = True
+                
+                # Commit if flying to customer with valid PICKED_UP cargo
+                if (drone_status == DroneStatus.FLYING_TO_CUSTOMER and 
+                    current_order['status'] == OrderStatus.PICKED_UP and
+                    current_order.get('assigned_drone') == drone_id and
+                    current_serving in drone.get('cargo', set())):
+                    should_commit_to_current_task = True
+            
+            # Skip PPO decision if committed to current task
+            if should_commit_to_current_task:
                 continue
 
             # Map choice: [-1, 1] -> [0, K-1]
@@ -2167,6 +2336,20 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                     )
             elif order['status'] == OrderStatus.ASSIGNED:
                 # Order assigned but not picked up -> go to merchant
+                merchant_id = order.get('merchant_id')
+                if merchant_id and merchant_id in self.merchants:
+                    merchant_loc = self.merchants[merchant_id]['location']
+                    drone['target_location'] = merchant_loc
+                    drone['current_merchant_id'] = merchant_id
+                    self.state_manager.update_drone_status(
+                        drone_id, DroneStatus.FLYING_TO_MERCHANT, target_location=merchant_loc
+                    )
+            elif order['status'] == OrderStatus.READY:
+                # Order is READY (not yet assigned) -> assign it first, then go to merchant
+                # This handles the case where PPO selects a READY order from candidates
+                self._process_single_assignment(drone_id, order_id, allow_busy=True)
+                # After assignment, order status is now ASSIGNED
+                # Set target to merchant
                 merchant_id = order.get('merchant_id')
                 if merchant_id and merchant_id in self.merchants:
                     merchant_loc = self.merchants[merchant_id]['location']
@@ -3129,9 +3312,22 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         if not self.enable_legacy_fallback:
             # Legacy fallback is disabled - track blocked attempt
             self.legacy_blocked_count += 1
+            
+            # Determine reason for blocking
+            reason = "legacy_batch_logic"
+            if serving_order_id is None:
+                if not drone.get('planned_stops') or len(drone['planned_stops']) == 0:
+                    reason = "no_serving_order_no_route"
+                else:
+                    reason = "no_serving_order_has_route"
+            else:
+                reason = "has_serving_order_legacy_path"
+            
+            self._record_legacy_blocked_reason(reason, drone_id)
+            
             if self.debug_state_warnings:
                 print(f"[Legacy Blocked] Drone {drone_id} arrival at {drone['status']} - "
-                      f"serving_order_id={serving_order_id}, total_blocked={self.legacy_blocked_count}")
+                      f"serving_order_id={serving_order_id}, reason={reason}, total_blocked={self.legacy_blocked_count}")
             # Without legacy fallback, drone should remain in current state or go idle
             # If drone has no serving_order_id and no planned route, it should be idle
             if serving_order_id is None and (not drone.get('planned_stops') or len(drone['planned_stops']) == 0):

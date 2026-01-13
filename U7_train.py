@@ -260,9 +260,27 @@ class MOPSOAssignWrapper(gym.Wrapper):
             if has_valid:
                 self.stats['drones_with_valid_candidates'] += 1
 
-            # Only check at decision points (same logic as env)
-            if not env._is_at_decision_point(drone_id):
-                continue
+            # Task commitment logic to prevent thrashing
+            # Skip validation if drone is committed to completing current sub-task
+            drone = env.drones[drone_id]
+            current_serving = drone.get('serving_order_id')
+            
+            if current_serving is not None and current_serving in env.orders:
+                current_order = env.orders[current_serving]
+                drone_status = drone['status']
+                
+                # Commit if flying to merchant with valid ASSIGNED order
+                if (drone_status.name == 'FLYING_TO_MERCHANT' and 
+                    current_order['status'].name == 'ASSIGNED' and
+                    current_order.get('assigned_drone') == drone_id):
+                    continue
+                
+                # Commit if flying to customer with valid PICKED_UP cargo
+                if (drone_status.name == 'FLYING_TO_CUSTOMER' and 
+                    current_order['status'].name == 'PICKED_UP' and
+                    current_order.get('assigned_drone') == drone_id and
+                    current_serving in drone.get('cargo', set())):
+                    continue
 
             # Decode PPO choice
             choice_raw = float(action[drone_id, 0])
@@ -347,6 +365,7 @@ def make_env(
     mopso_max_orders_per_drone: int,
     fallback_policy: str,
     debug_stats_interval: int,
+    enable_legacy_fallback: bool = True,
 ) -> gym.Env:
     env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
@@ -361,6 +380,7 @@ def make_env(
         debug_state_warnings=debug_state_warnings,
         fixed_objective_weights=(0.5, 0.3, 0.2),
         num_candidates=candidate_k,         # K=20
+        enable_legacy_fallback=enable_legacy_fallback,
     )
 
     planner = MOPSOPlanner(
@@ -402,6 +422,7 @@ def train(args):
             mopso_max_orders_per_drone=args.mopso_max_orders_per_drone,
             fallback_policy=args.fallback_policy,
             debug_stats_interval=args.debug_stats_interval,
+            enable_legacy_fallback=args.enable_legacy_fallback,
         )
 
     env = DummyVecEnv([env_fn])
@@ -414,6 +435,7 @@ def train(args):
     print(f"MOPSO assignment: M={args.mopso_max_orders}, max_orders_per_drone={args.mopso_max_orders_per_drone}")
     print(f"reward_output_mode=scalar, enable_random_events={args.enable_random_events}")
     print(f"fallback_policy={args.fallback_policy}, debug_stats_interval={args.debug_stats_interval}")
+    print(f"enable_legacy_fallback={args.enable_legacy_fallback}")
     print("=" * 70)
 
     model = PPO(
@@ -475,6 +497,9 @@ def main():
     p.add_argument("--debug-stats-interval", type=int, default=0,
                    help="Print debug stats every N steps (0=disabled). Shows candidate validity "
                         "and fallback usage statistics. Default: 0 (disabled)")
+    p.add_argument("--enable-legacy-fallback", action="store_true",
+                   help="Enable legacy fallback behavior (batch orders auto-pickup). "
+                        "Default: False (disabled for clean PPO+MOPSO experiments)")
 
     # ppo knobs
     p.add_argument("--lr", type=float, default=3e-4)
