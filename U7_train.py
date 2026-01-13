@@ -36,7 +36,7 @@ import gymnasium as gym
 # repo root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from UAV_ENVIRONMENT_7 import ThreeObjectiveDroneDeliveryEnv
+from UAV_ENVIRONMENT_7 import ThreeObjectiveDroneDeliveryEnv, OrderStatus
 from U7_mopso_dispatcher import MOPSOPlanner
 
 
@@ -49,6 +49,9 @@ def greedy_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, max_ready: int =
     Fallback assignment-only policy:
     - For each READY order (up to max_ready), assign to the nearest drone that can_accept_more.
     - Uses env._process_single_assignment(drone_id, order_id, allow_busy=True).
+    
+    KEY FIX: Only assign to drones that don't have pending ASSIGNED orders.
+    
     Returns number of orders newly assigned.
     """
     ready_orders = env.get_ready_orders_snapshot(limit=max_ready)
@@ -67,13 +70,29 @@ def greedy_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, max_ready: int =
         best = None
         best_cost = 1e18
         for d in drones:
+            drone_id = int(d["drone_id"])
+            
             if not d.get("can_accept_more", False):
                 continue
+            
+            # KEY FIX: Check if drone has pending ASSIGNED orders
+            has_pending_assigned = False
+            for assigned_oid in env.active_orders:
+                order = env.orders.get(assigned_oid)
+                if order and order.get('assigned_drone') == drone_id:
+                    if order['status'] == OrderStatus.ASSIGNED:
+                        has_pending_assigned = True
+                        break
+            
+            # Skip if drone has pending pickup work
+            if has_pending_assigned:
+                continue
+            
             # keep it simple: choose nearest by current location
             cost = _euclid(d["location"], mloc)
             if cost < best_cost:
                 best_cost = cost
-                best = int(d["drone_id"])
+                best = drone_id
 
         if best is None:
             continue
@@ -96,6 +115,9 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
       - Run planner.mopso_dispatch(env) to get plans, but DO NOT apply planned_stops.
       - Instead, extract commit_orders and call env._process_single_assignment for each.
     Finally fallback to greedy_assignment_only if neither works.
+    
+    KEY FIX: Only assign to drones that don't have pending ASSIGNED orders to avoid
+    order chasing behavior where drones never pick up existing assignments.
     """
     # 1) If dispatcher provides an explicit assignment-only helper, use it.
     try:
@@ -120,6 +142,21 @@ def mopso_assignment_only(env: ThreeObjectiveDroneDeliveryEnv, planner: MOPSOPla
 
         assigned = 0
         for drone_id, (_planned_stops, commit_orders) in plans.items():
+            drone = env.drones[int(drone_id)]
+            
+            # KEY FIX: Check if drone has pending ASSIGNED orders (not picked up yet)
+            has_pending_assigned = False
+            for oid in env.active_orders:
+                order = env.orders.get(oid)
+                if order and order.get('assigned_drone') == int(drone_id):
+                    if order['status'] == OrderStatus.ASSIGNED:
+                        has_pending_assigned = True
+                        break
+            
+            # Skip assignment if drone has pending pickup work
+            if has_pending_assigned:
+                continue
+            
             for oid in commit_orders:
                 before = env.drones[int(drone_id)]["current_load"]
                 env._process_single_assignment(int(drone_id), int(oid), allow_busy=True)

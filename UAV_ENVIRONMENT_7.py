@@ -1089,8 +1089,8 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                  reward_output_mode: str = "zero",
                  enable_random_events: bool = True,  # 可选：评估时建议关掉随机事件
                  debug_state_warnings: bool = False,  # Task B: control state consistency warning output
-                 delivery_sla_steps: int = 3,  # READY-based delivery SLA in steps
-                 timeout_factor: float = 4.0,  # Multiplier for deadline calculation
+                 delivery_sla_steps: int = 6,  # READY-based delivery SLA in steps (increased for better pickup time)
+                 timeout_factor: float = 8.0,  # Multiplier for deadline calculation (increased for better pickup time)
                  # ===== U7: Task selection parameters =====
                  num_candidates: int = 20,  # K=20 candidate orders per drone for PPO selection
                  # ===== Legacy fallback control =====
