@@ -14,16 +14,12 @@ from sklearn.cluster import KMeans
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
 
-# ===== Constants for action processing =====
-SPEED_MULTIPLIER_MIN = 0.5  # Minimum speed multiplier
-SPEED_MULTIPLIER_MAX = 1.5  # Maximum speed multiplier
-
 # ===== Constants for state management =====
 ARRIVAL_THRESHOLD = 0.5  # Distance threshold for considering drone arrived at target
 DISTANCE_CLOSE_THRESHOLD = 0.15  # Distance threshold for decision point detection
 
-
-# Speed multiplier u ∈ [-1, 1] is mapped to [0.5, 1.5] via: (u + 1) / 2 * (max - min) + min
+# ===== Fixed speed multiplier (U8: no longer controlled by PPO) =====
+FIXED_SPEED_MULTIPLIER = 1.0  # Fixed speed multiplier for all drones
 
 
 def set_global_seed(seed):
@@ -1400,12 +1396,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             'objective_weights': spaces.Box(low=0, high=1, shape=(self.num_objectives,), dtype=np.float32),
         })
 
-        # U7: PPO outputs task choice (continuous [-1, 1] mapped to discrete [0, K-1]) + speed multiplier
-        # Action shape: (num_drones, 2) where:
-        #   [:, 0] is choice in [-1, 1] (continuous) -> internally discretized to [0, K-1]
-        #   [:, 1] is speed in [-1, 1] (continuous) -> mapped to [0.5, 1.5]
+        # U8: PPO outputs task choice only (continuous [-1, 1] mapped to discrete [0, K-1])
+        # Action shape: (num_drones,) where each element is choice in [-1, 1]
+        # Speed is controlled by a fixed multiplier, not by PPO action
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_drones, 2), dtype=np.float32,
+            low=-1.0, high=1.0, shape=(self.num_drones,), dtype=np.float32,
         )
 
     # ------------------ 时间单位统一：minutes <-> steps ------------------
@@ -2165,10 +2160,10 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
 
     def _process_action(self, action):
         """
-        U7: Process action containing task choice + speed control.
-        Action shape: (num_drones, 2) where:
-          action[d, 0]: task choice in [-1, 1] -> discretized to [0, K-1]
-          action[d, 1]: speed multiplier in [-1, 1] -> mapped to [0.5, 1.5]
+        U8: Process action containing task choice only (speed is fixed).
+        Action shape: (num_drones,) where:
+          action[d]: task choice in [-1, 1] -> discretized to [0, K-1]
+        Speed is controlled by a fixed multiplier (default 1.0).
         """
         self._last_route_heading = action
 
@@ -2179,17 +2174,11 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         for drone_id in range(self.num_drones):
             drone = self.drones[drone_id]
 
-            # Extract action components
-            choice_raw = float(action[drone_id, 0])
-            speed_raw = float(action[drone_id, 1])
+            # Extract action component (task choice only)
+            choice_raw = float(action[drone_id])
 
-            # Map speed: [-1, 1] -> [0.5, 1.5]
-            speed_multiplier = (speed_raw + 1.0) / 2.0 * (
-                    SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
-            speed_multiplier = np.clip(speed_multiplier, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
-
-            # Store speed multiplier (used in movement)
-            drone['ppo_speed_multiplier'] = float(speed_multiplier)
+            # Store fixed speed multiplier (used in movement)
+            drone['ppo_speed_multiplier'] = FIXED_SPEED_MULTIPLIER
 
             # Only process task choice at decision points
             if not self._is_at_decision_point(drone_id):
@@ -2809,8 +2798,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
         # Sync drone status with route plan at the start of position update
         self._sync_drone_status_with_route()
 
-        headings = getattr(self, "_last_route_heading", None)
-
         for drone_id, drone in self.drones.items():
             self.path_visualizer.update_path_history(drone_id, drone["location"])
 
@@ -2819,12 +2806,6 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 DroneStatus.FLYING_TO_CUSTOMER,
                 DroneStatus.RETURNING_TO_BASE,
             ]:
-                # RETURNING_TO_BASE：完全按目标直飞，不听 PPO
-                if drone["status"] == DroneStatus.RETURNING_TO_BASE:
-                    alpha = 0.0
-                else:
-                    alpha = float(self.heading_guidance_alpha)
-
                 if "target_location" not in drone:
                     self._reset_drone_to_base(drone_id, drone)
                     continue
@@ -2846,47 +2827,18 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
                 if speed <= 1e-6:
                     continue
 
-                if headings is None:
-                    ppo_hx, ppo_hy, ppo_u = 0.0, 0.0, 1.0
-                else:
-                    # Extract (hx, hy, u) from action - u is speed multiplier
-                    action_vec = headings[int(drone_id)]
-                    ppo_hx, ppo_hy = action_vec[0], action_vec[1]
-                    ppo_u = float(action_vec[2]) if len(action_vec) > 2 else 1.0
+                # U8: Use fixed speed multiplier (stored in drone during action processing)
+                # Default to 1.0 if not set yet
+                speed_multiplier = drone.get('ppo_speed_multiplier', 1.0)
 
-                    # Map u from [-1, 1] to [SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX]
-                    # Using standard linear interpolation:
-                    #   normalized = (value - old_min) / (old_max - old_min)
-                    #   result = normalized * (new_max - new_min) + new_min
-                    # Here: old_range=[-1,1], new_range=[0.5,1.5]
-                    normalized_u = (ppo_u + 1.0) / 2.0  # Map to [0, 1]
-                    ppo_u = normalized_u * (SPEED_MULTIPLIER_MAX - SPEED_MULTIPLIER_MIN) + SPEED_MULTIPLIER_MIN
-                    ppo_u = np.clip(ppo_u, SPEED_MULTIPLIER_MIN, SPEED_MULTIPLIER_MAX)
-
-                ppo_norm = math.sqrt(ppo_hx * ppo_hx + ppo_hy * ppo_hy)
-                if ppo_norm > 1e-6:
-                    ppo_hx /= ppo_norm
-                    ppo_hy /= ppo_norm
-                else:
-                    ppo_hx, ppo_hy = 0.0, 0.0
-
+                # Move directly towards target (no heading guidance, since we removed that feature)
                 tgt_hx = to_target_dx / max(dist_to_target, 1e-6)
                 tgt_hy = to_target_dy / max(dist_to_target, 1e-6)
 
-                move_hx = alpha * ppo_hx + (1.0 - alpha) * tgt_hx
-                move_hy = alpha * ppo_hy + (1.0 - alpha) * tgt_hy
-
-                move_norm = math.sqrt(move_hx * move_hx + move_hy * move_hy)
-                if move_norm > 1e-6:
-                    move_hx /= move_norm
-                    move_hy /= move_norm
-                else:
-                    move_hx, move_hy = tgt_hx, tgt_hy
-
-                # Apply speed multiplier from PPO action
-                step_len = min(speed * ppo_u, dist_to_target)
-                nx = float(np.clip(cx + move_hx * step_len, 0, self.grid_size - 1))
-                ny = float(np.clip(cy + move_hy * step_len, 0, self.grid_size - 1))
+                # Apply speed multiplier
+                step_len = min(speed * speed_multiplier, dist_to_target)
+                nx = float(np.clip(cx + tgt_hx * step_len, 0, self.grid_size - 1))
+                ny = float(np.clip(cy + tgt_hy * step_len, 0, self.grid_size - 1))
 
                 if "last_location" in drone:
                     step_distance = float(
