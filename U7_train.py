@@ -260,8 +260,27 @@ class MOPSOAssignWrapper(gym.Wrapper):
             if has_valid:
                 self.stats['drones_with_valid_candidates'] += 1
 
-            # Process PPO choice - allow changes at any step
-            # (User request: remove decision point restriction)
+            # Task commitment logic to prevent thrashing
+            # Skip validation if drone is committed to completing current sub-task
+            drone = env.drones[drone_id]
+            current_serving = drone.get('serving_order_id')
+            
+            if current_serving is not None and current_serving in env.orders:
+                current_order = env.orders[current_serving]
+                drone_status = drone['status']
+                
+                # Commit if flying to merchant with valid ASSIGNED order
+                if (drone_status.name == 'FLYING_TO_MERCHANT' and 
+                    current_order['status'].name == 'ASSIGNED' and
+                    current_order.get('assigned_drone') == drone_id):
+                    continue
+                
+                # Commit if flying to customer with valid PICKED_UP cargo
+                if (drone_status.name == 'FLYING_TO_CUSTOMER' and 
+                    current_order['status'].name == 'PICKED_UP' and
+                    current_order.get('assigned_drone') == drone_id and
+                    current_serving in drone.get('cargo', set())):
+                    continue
 
             # Decode PPO choice
             choice_raw = float(action[drone_id, 0])

@@ -2268,8 +2268,36 @@ class ThreeObjectiveDroneDeliveryEnv(gym.Env):
             # Store speed multiplier (used in movement)
             drone['ppo_speed_multiplier'] = float(speed_multiplier)
 
-            # Process task choice - allow PPO to change target at any step
-            # (User request: remove decision point restriction for more flexible control)
+            # Process task choice with smart commitment logic
+            # Allow PPO to change targets, but prevent task thrashing by:
+            # - Completing pickups before switching (if FLYING_TO_MERCHANT with ASSIGNED order)
+            # - Completing deliveries before switching (if FLYING_TO_CUSTOMER with PICKED_UP cargo)
+            # - Allowing switches when IDLE or when current task is invalid
+            
+            # Check if drone should be committed to current task
+            should_commit_to_current_task = False
+            current_serving = drone.get('serving_order_id')
+            
+            if current_serving is not None and current_serving in self.orders:
+                current_order = self.orders[current_serving]
+                drone_status = drone['status']
+                
+                # Commit if flying to merchant with valid ASSIGNED order
+                if (drone_status == DroneStatus.FLYING_TO_MERCHANT and 
+                    current_order['status'] == OrderStatus.ASSIGNED and
+                    current_order.get('assigned_drone') == drone_id):
+                    should_commit_to_current_task = True
+                
+                # Commit if flying to customer with valid PICKED_UP cargo
+                if (drone_status == DroneStatus.FLYING_TO_CUSTOMER and 
+                    current_order['status'] == OrderStatus.PICKED_UP and
+                    current_order.get('assigned_drone') == drone_id and
+                    current_serving in drone.get('cargo', set())):
+                    should_commit_to_current_task = True
+            
+            # Skip PPO decision if committed to current task
+            if should_commit_to_current_task:
+                continue
 
             # Map choice: [-1, 1] -> [0, K-1]
             # Using min to handle edge case where choice_raw = 1.0 would give K
