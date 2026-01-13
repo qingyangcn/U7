@@ -161,6 +161,8 @@ class MOPSOAssignWrapper(gym.Wrapper):
             'fallback_used': 0,
             'drones_with_cargo': 0,
             'cargo_first_applied': 0,
+            'no_valid_candidate_count': 0,
+            'overridden_valid_choice_count': 0,
         }
 
     def _get_fallback_candidate_idx(self, drone_id: int, candidate_list: list) -> Optional[int]:
@@ -228,6 +230,9 @@ class MOPSOAssignWrapper(gym.Wrapper):
             # Map fallback_idx back to [-1, 1] range (center of bin)
             new_choice_raw = (fallback_idx + 0.5) * 2.0 / num_candidates - 1.0
             sanitized_action[drone_id, 0] = new_choice_raw
+        else:
+            # No valid candidate found - PPO chose invalid and no fallback available
+            self.stats['no_valid_candidate_count'] += 1
 
     def _apply_fallback_and_sanitize_action(self, action: np.ndarray) -> np.ndarray:
         """
@@ -292,14 +297,20 @@ class MOPSOAssignWrapper(gym.Wrapper):
         valid_frac = self.stats['drones_with_valid_candidates'] / self.stats['total_drones_checked']
         invalid_frac = self.stats['ppo_invalid_choices'] / self.stats['total_drones_checked']
         cargo_frac = self.stats['drones_with_cargo'] / self.stats['total_drones_checked']
+        
+        fallback_success_rate = 0.0
+        if self.stats['ppo_invalid_choices'] > 0:
+            fallback_success_rate = self.stats['fallback_used'] / self.stats['ppo_invalid_choices']
 
         cargo_first_frac = 0.0
         if self.stats['drones_with_cargo'] > 0:
             cargo_first_frac = self.stats['cargo_first_applied'] / self.stats['drones_with_cargo']
 
-        print(f"\n[Step {self.step_count}] Debug Stats:")
+        print(f"\n[Wrapper Step {self.step_count}] Debug Stats:")
         print(f"  Drones with ≥1 valid candidate: {valid_frac:.2%} ({self.stats['drones_with_valid_candidates']}/{self.stats['total_drones_checked']})")
-        print(f"  PPO invalid choices (fallback used): {invalid_frac:.2%} ({self.stats['ppo_invalid_choices']}/{self.stats['total_drones_checked']})")
+        print(f"  PPO invalid choices: {invalid_frac:.2%} ({self.stats['ppo_invalid_choices']}/{self.stats['total_drones_checked']})")
+        print(f"  Fallback success rate: {fallback_success_rate:.2%} ({self.stats['fallback_used']}/{self.stats['ppo_invalid_choices']})")
+        print(f"  No valid candidate (PPO invalid, no fallback): {self.stats['no_valid_candidate_count']}")
         print(f"  Drones with cargo: {cargo_frac:.2%} ({self.stats['drones_with_cargo']}/{self.stats['total_drones_checked']})")
         if self.stats['drones_with_cargo'] > 0:
             print(f"  Cargo-first fallback applied: {cargo_first_frac:.2%} ({self.stats['cargo_first_applied']}/{self.stats['drones_with_cargo']})")
@@ -347,6 +358,9 @@ def make_env(
     mopso_max_orders_per_drone: int,
     fallback_policy: str,
     debug_stats_interval: int,
+    enable_legacy_fallback: bool,
+    enable_diagnostics: bool,
+    diagnostics_interval: int,
 ) -> gym.Env:
     env = ThreeObjectiveDroneDeliveryEnv(
         grid_size=16,
@@ -361,6 +375,9 @@ def make_env(
         debug_state_warnings=debug_state_warnings,
         fixed_objective_weights=(0.5, 0.3, 0.2),
         num_candidates=candidate_k,         # K=20
+        enable_legacy_fallback=enable_legacy_fallback,
+        enable_diagnostics=enable_diagnostics,
+        diagnostics_interval=diagnostics_interval,
     )
 
     planner = MOPSOPlanner(
@@ -402,6 +419,9 @@ def train(args):
             mopso_max_orders_per_drone=args.mopso_max_orders_per_drone,
             fallback_policy=args.fallback_policy,
             debug_stats_interval=args.debug_stats_interval,
+            enable_legacy_fallback=args.enable_legacy_fallback,
+            enable_diagnostics=args.enable_diagnostics,
+            diagnostics_interval=args.diagnostics_interval,
         )
 
     env = DummyVecEnv([env_fn])
@@ -412,6 +432,10 @@ def train(args):
     print(f"num_drones={args.num_drones}, obs_max_orders={args.obs_max_orders}, top_k_merchants={args.top_k_merchants}")
     print(f"candidate_k={args.candidate_k}")
     print(f"MOPSO assignment: M={args.mopso_max_orders}, max_orders_per_drone={args.mopso_max_orders_per_drone}")
+    print(f"reward_output_mode=scalar, enable_random_events={args.enable_random_events}")
+    print(f"fallback_policy={args.fallback_policy}, debug_stats_interval={args.debug_stats_interval}")
+    print(f"enable_legacy_fallback={args.enable_legacy_fallback}")
+    print(f"enable_diagnostics={args.enable_diagnostics}, diagnostics_interval={args.diagnostics_interval}")
     print(f"reward_output_mode=scalar, enable_random_events={args.enable_random_events}")
     print(f"fallback_policy={args.fallback_policy}, debug_stats_interval={args.debug_stats_interval}")
     print("=" * 70)
@@ -475,6 +499,16 @@ def main():
     p.add_argument("--debug-stats-interval", type=int, default=0,
                    help="Print debug stats every N steps (0=disabled). Shows candidate validity "
                         "and fallback usage statistics. Default: 0 (disabled)")
+    
+    # legacy fallback control
+    p.add_argument("--enable-legacy-fallback", action="store_true",
+                   help="Enable legacy fallback behavior (default: disabled for testing PPO+MOPSO)")
+    
+    # diagnostics control
+    p.add_argument("--enable-diagnostics", action="store_true",
+                   help="Enable detailed environment diagnostics (default: disabled)")
+    p.add_argument("--diagnostics-interval", type=int, default=100,
+                   help="Print environment diagnostics every N steps (default: 100)")
 
     # ppo knobs
     p.add_argument("--lr", type=float, default=3e-4)
